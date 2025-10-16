@@ -1,4 +1,4 @@
-AI for Vampire Survivors
+AI for Vampire Survivors, Melonloader mod.
 
 F6/F7 — toggle AutoEvade ON/OFF
 
