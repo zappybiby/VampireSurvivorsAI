@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>AI_Mod</AssemblyName>
+    <RootNamespace>AI_Mod</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+
+    <!-- Set the path to your Vampire Survivors installation -->
+    <GameDir>E:\steam\steamapps\common\Vampire Survivors</GameDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- CORE libs -->
+    <Reference Include="MelonLoader">
+      <HintPath>$(GameDir)\MelonLoader\net6\MelonLoader.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(GameDir)\MelonLoader\net6\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppInterop.Runtime">
+      <HintPath>$(GameDir)\MelonLoader\net6\Il2CppInterop.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- All game/Unity IL2CPP assemblies -->
+    <Reference Include="$(GameDir)\MelonLoader\Il2CppAssemblies\*.dll">
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Copy the built DLL into the game's Mods folder -->
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)\Mods" />
+    <Message Text="Copied $(TargetFileName) to $(GameDir)\Mods" Importance="high" />
+  </Target>
+
+</Project>
