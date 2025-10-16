@@ -9,3 +9,5 @@ F9 — toggle sensors
 F10 — cycle gameplay cameras (debug thingy for overlay alignment)
 
 Currently breaks input after first run, oopsies.
+
+![Image](VS_AI.PNG)
