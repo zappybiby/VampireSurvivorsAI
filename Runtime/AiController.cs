@@ -355,6 +355,7 @@ namespace AI_Mod.Runtime
         private const float KitingRadiusWeight = 8f;
         private const float KitingOutrunWeight = 6f;
         private const float KitingAlignmentThreshold = 0.2f;
+        private const float PlanWallCullRadius = 5.35f;
 
         private readonly PlannerDebugInfo _debugInfo = new PlannerDebugInfo();
         private readonly List<Vector2> _trajectoryScratch = new List<Vector2>(SimulationSteps + 1);
@@ -367,6 +368,7 @@ namespace AI_Mod.Runtime
         private int _enemyCount;
         private int _bulletCount;
         private float _maxGemRewardPerStep;
+        private readonly List<WallTilemap> _planWallTilemaps = new List<WallTilemap>(8);
 
         internal PlannerDebugInfo DebugInfo => _debugInfo;
 
@@ -399,6 +401,8 @@ namespace AI_Mod.Runtime
                 playerSafeRadius,
                 out _bulletCount);
             _maxGemRewardPerStep = ComputeMaxGemRewardPerStep(world.Gems, gemScale);
+            var planCullRadius = Mathf.Max(PlanWallCullRadius, playerSafeRadius);
+            CollectRelevantWallTilemaps(world.WallTilemaps, origin, planCullRadius, _planWallTilemaps);
             var bestScore = float.MinValue;
             var bestDirection = Vector2.zero;
             var bestAlignment = float.NegativeInfinity;
@@ -416,7 +420,7 @@ namespace AI_Mod.Runtime
                     origin,
                     velocity,
                     playerRadius,
-                    world.Walls,
+                    _planWallTilemaps,
                     world.Gems,
                     encirclement,
                     gemScale,
@@ -550,7 +554,7 @@ namespace AI_Mod.Runtime
             Vector2 origin,
             Vector2 velocity,
             float playerRadius,
-            IReadOnlyList<WallSegment> walls,
+            IReadOnlyList<WallTilemap> wallTilemaps,
             IReadOnlyList<GemSnapshot> gems,
             EncirclementSnapshot encirclement,
             float gemScale,
@@ -604,7 +608,7 @@ namespace AI_Mod.Runtime
                     }
                 }
 
-                var wallPenalty = EvaluateWallPenalty(position, walls, playerRadius);
+                var wallPenalty = EvaluateWallPenalty(position, wallTilemaps, playerRadius);
                 if (float.IsPositiveInfinity(wallPenalty) || float.IsNaN(wallPenalty))
                 {
                     return float.NegativeInfinity;
@@ -644,6 +648,44 @@ namespace AI_Mod.Runtime
             }
 
             return score;
+        }
+
+        private static void CollectRelevantWallTilemaps(
+            IReadOnlyList<WallTilemap> source,
+            Vector2 center,
+            float radius,
+            List<WallTilemap> destination)
+        {
+            destination.Clear();
+            if (source.Count == 0)
+            {
+                return;
+            }
+
+            for (var i = 0; i < source.Count; i++)
+            {
+                var entry = source[i];
+                var tilemap = entry.Tilemap;
+                if (tilemap == null || tilemap.Equals(null))
+                {
+                    continue;
+                }
+
+                if (radius <= 0f)
+                {
+                    var boundsCenter = entry.WorldBounds.center;
+                    if (entry.WorldBounds.Contains(new Vector3(center.x, center.y, boundsCenter.z)))
+                    {
+                        destination.Add(entry);
+                    }
+                    continue;
+                }
+
+                if (CircleIntersectsBounds(center, radius, entry.WorldBounds))
+                {
+                    destination.Add(entry);
+                }
+            }
         }
         private float ComputeBreakoutBonus(Vector2 direction, EncirclementSnapshot encirclement, float breakoutExitTime)
         {
@@ -707,9 +749,9 @@ namespace AI_Mod.Runtime
             return penalty;
         }
 
-        private float EvaluateWallPenalty(Vector2 position, IReadOnlyList<WallSegment> walls, float radius)
+        private float EvaluateWallPenalty(Vector2 position, IReadOnlyList<WallTilemap> wallTilemaps, float radius)
         {
-            if (walls.Count == 0)
+            if (wallTilemaps.Count == 0)
             {
                 return 0f;
             }
@@ -724,27 +766,106 @@ namespace AI_Mod.Runtime
             var safeRadiusSquared = safeRadius * safeRadius;
             var penalty = 0f;
 
-            for (var i = 0; i < walls.Count; i++)
+            for (var i = 0; i < wallTilemaps.Count; i++)
             {
-                var bounds = walls[i].Bounds;
-                var distanceSquared = DistanceSquaredToRect(bounds, position);
-
-                if (distanceSquared <= radiusSquared)
+                var entry = wallTilemaps[i];
+                var tilemap = entry.Tilemap;
+                if (tilemap == null || tilemap.Equals(null))
                 {
-                    return float.PositiveInfinity;
+                    continue;
                 }
 
-                if (distanceSquared < safeRadiusSquared)
+                if (!CircleIntersectsBounds(position, safeRadius, entry.WorldBounds))
                 {
-                    var distance = Mathf.Sqrt(distanceSquared);
-                    var separation = safeRadius - distance;
-                    var normalized = separation / safeRadius;
-                    var amplification = safeRadius / Mathf.Max(distance - radius, 0.001f);
-                    penalty += normalized * amplification;
+                    continue;
+                }
+
+                var cellBounds = entry.CellBounds;
+                if (cellBounds.size.x <= 0 || cellBounds.size.y <= 0)
+                {
+                    continue;
+                }
+
+                var cell = tilemap.WorldToCell(new Vector3(position.x, position.y, tilemap.transform.position.z));
+                var cellSize = entry.CellSize;
+                var cellSizeX = Mathf.Abs(cellSize.x);
+                var cellSizeY = Mathf.Abs(cellSize.y);
+                if (cellSizeX < 0.0001f || cellSizeY < 0.0001f)
+                {
+                    continue;
+                }
+
+                var extentX = Mathf.Max(0, Mathf.CeilToInt(safeRadius / cellSizeX));
+                var extentY = Mathf.Max(0, Mathf.CeilToInt(safeRadius / cellSizeY));
+                var xMin = Mathf.Max(cellBounds.xMin, cell.x - extentX);
+                var xMax = Mathf.Min(cellBounds.xMax - 1, cell.x + extentX);
+                if (xMin > xMax)
+                {
+                    continue;
+                }
+
+                var yMin = Mathf.Max(cellBounds.yMin, cell.y - extentY);
+                var yMax = Mathf.Min(cellBounds.yMax - 1, cell.y + extentY);
+                if (yMin > yMax)
+                {
+                    continue;
+                }
+
+                var halfX = cellSizeX * 0.5f;
+                var halfY = cellSizeY * 0.5f;
+                var baseZ = cell.z;
+
+                for (var cx = xMin; cx <= xMax; cx++)
+                {
+                    for (var cy = yMin; cy <= yMax; cy++)
+                    {
+                        var candidateCell = new Vector3Int(cx, cy, baseZ);
+                        if (!tilemap.HasTile(candidateCell))
+                        {
+                            continue;
+                        }
+
+                        var worldCenter = tilemap.GetCellCenterWorld(candidateCell);
+                        var rect = new Rect(
+                            worldCenter.x - halfX,
+                            worldCenter.y - halfY,
+                            cellSizeX,
+                            cellSizeY);
+                        var distanceSquared = DistanceSquaredToRect(rect, position);
+
+                        if (distanceSquared <= radiusSquared)
+                        {
+                            return float.PositiveInfinity;
+                        }
+
+                        if (distanceSquared < safeRadiusSquared)
+                        {
+                            var distance = Mathf.Sqrt(distanceSquared);
+                            var separation = safeRadius - distance;
+                            var normalized = separation / safeRadius;
+                            var amplification = safeRadius / Mathf.Max(distance - radius, 0.001f);
+                            penalty += normalized * amplification;
+                        }
+                    }
                 }
             }
 
             return penalty;
+        }
+
+        private static bool CircleIntersectsBounds(Vector2 center, float radius, Bounds bounds)
+        {
+            var query = new Vector3(center.x, center.y, bounds.center.z);
+            if (radius <= 0f)
+            {
+                return bounds.Contains(query);
+            }
+
+            var closest = bounds.ClosestPoint(query);
+            var dx = closest.x - center.x;
+            var dy = closest.y - center.y;
+            var radiusSquared = radius * radius;
+            return dx * dx + dy * dy <= radiusSquared;
         }
 
         private static float DistanceSquaredToRect(Rect rect, Vector2 point)

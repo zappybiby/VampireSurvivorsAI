@@ -26,7 +26,7 @@ namespace AI_Mod.Runtime
         private readonly List<DynamicObstacle> _enemies = new List<DynamicObstacle>();
         private readonly List<DynamicObstacle> _bullets = new List<DynamicObstacle>();
         private readonly List<GemSnapshot> _gems = new List<GemSnapshot>();
-        private readonly List<WallSegment> _walls = new List<WallSegment>();
+        private readonly List<WallTilemap> _wallTilemaps = new List<WallTilemap>();
         private readonly FallbackLogger _fallbacks = new FallbackLogger();
         private readonly List<BulletPoolBinding> _bulletPools = new List<BulletPoolBinding>();
         private static readonly HashSet<string> ProjectilePoolNames = new HashSet<string>(StringComparer.Ordinal)
@@ -48,7 +48,7 @@ namespace AI_Mod.Runtime
         internal IReadOnlyList<DynamicObstacle> EnemyObstacles => _enemies;
         internal IReadOnlyList<DynamicObstacle> BulletObstacles => _bullets;
         internal IReadOnlyList<GemSnapshot> Gems => _gems;
-        internal IReadOnlyList<WallSegment> Walls => _walls;
+        internal IReadOnlyList<WallTilemap> WallTilemaps => _wallTilemaps;
         [HideFromIl2Cpp]
         internal int Version => _version;
         internal EncirclementSnapshot Encirclement => _encirclement;
@@ -58,7 +58,7 @@ namespace AI_Mod.Runtime
             _enemies.Clear();
             _bullets.Clear();
             _gems.Clear();
-            _walls.Clear();
+            _wallTilemaps.Clear();
             _wallsCached = false;
             _stage = null;
             _fallbacks.ResetTransient();
@@ -1029,11 +1029,11 @@ namespace AI_Mod.Runtime
 
         private void RefreshWalls()
         {
-            _walls.Clear();
+            _wallTilemaps.Clear();
             var tilemaps = UnityEngine.Object.FindObjectsOfType<Tilemap>(true);
             foreach (var tilemap in tilemaps)
             {
-                if (tilemap == null || tilemap.gameObject == null)
+                if (tilemap == null || tilemap.gameObject == null || tilemap.gameObject.Equals(null))
                 {
                     continue;
                 }
@@ -1045,46 +1045,115 @@ namespace AI_Mod.Runtime
                     continue;
                 }
 
-                AppendTilemapWalls(tilemap);
+                if (TryCreateWallTilemap(tilemap, out var wallTilemap))
+                {
+                    _wallTilemaps.Add(wallTilemap);
+                }
             }
         }
 
-        private void AppendTilemapWalls(Tilemap tilemap)
+        private bool TryCreateWallTilemap(Tilemap tilemap, out WallTilemap wallTilemap)
         {
-            if (tilemap == null)
+            wallTilemap = default;
+            if (tilemap == null || tilemap.Equals(null))
             {
-                return;
+                return false;
             }
 
             var grid = tilemap.layoutGrid;
-            var cellSize = grid != null ? grid.cellSize : Vector3.one;
-
-            var bounds = tilemap.cellBounds;
-            var min = bounds.min;
-            var maxExclusive = bounds.max;
-
-            for (var x = min.x; x < maxExclusive.x; x++)
+            if (grid == null || grid.Equals(null))
             {
-                for (var y = min.y; y < maxExclusive.y; y++)
-                {
-                    for (var z = min.z; z < maxExclusive.z; z++)
-                    {
-                        var cell = new Vector3Int(x, y, z);
-                        if (!tilemap.HasTile(cell))
-                        {
-                            continue;
-                        }
-
-                        var worldCenter = tilemap.GetCellCenterWorld(cell);
-                        var rect = new Rect(
-                            worldCenter.x - cellSize.x * 0.5f,
-                            worldCenter.y - cellSize.y * 0.5f,
-                            cellSize.x,
-                            cellSize.y);
-                        _walls.Add(new WallSegment(rect));
-                    }
-                }
+                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
+                _fallbacks.WarnOnce($"WallTilemapGridMissing:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' missing layout grid; skipping wall registration.");
+                return false;
             }
+
+            var cellSize = grid.cellSize;
+            if (Mathf.Abs(cellSize.x) < 0.0001f || Mathf.Abs(cellSize.y) < 0.0001f)
+            {
+                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
+                _fallbacks.WarnOnce($"WallTilemapCellSizeInvalid:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' contained a near-zero cell size; skipping wall registration.");
+                return false;
+            }
+
+            int usedTileCount;
+            try
+            {
+                usedTileCount = tilemap.GetUsedTilesCount();
+            }
+            catch (Exception ex)
+            {
+                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
+                _fallbacks.WarnOnce($"WallTilemapUsedTilesFallback:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' GetUsedTilesCount failed: {ex.Message}; assuming tiles are present.");
+                usedTileCount = -1;
+            }
+
+            if (usedTileCount == 0)
+            {
+                return false;
+            }
+
+            var cellBounds = tilemap.cellBounds;
+            if (cellBounds.size.x <= 0 || cellBounds.size.y <= 0)
+            {
+                return false;
+            }
+
+            Bounds bounds;
+            try
+            {
+                bounds = ComputeTilemapWorldBounds(tilemap, cellSize, cellBounds);
+            }
+            catch (Exception ex)
+            {
+                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
+                _fallbacks.WarnOnce($"WallTilemapBoundsFallback:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' world bounds computation failed: {ex.Message}; skipping wall registration.");
+                return false;
+            }
+
+            if (bounds.size.sqrMagnitude <= 0f)
+            {
+                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
+                _fallbacks.WarnOnce($"WallTilemapEmptyBounds:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' produced empty world bounds; skipping wall registration.");
+                return false;
+            }
+
+            wallTilemap = new WallTilemap(tilemap, bounds, cellBounds, cellSize);
+            return true;
+        }
+
+        private static Bounds ComputeTilemapWorldBounds(Tilemap tilemap, Vector3 cellSize, BoundsInt cellBounds)
+        {
+            var minCell = cellBounds.min;
+            var maxCell = cellBounds.max;
+            var minCorner = new Vector3Int(minCell.x, minCell.y, minCell.z);
+            var maxCorner = new Vector3Int(maxCell.x - 1, maxCell.y - 1, minCell.z);
+            if (cellBounds.size.z > 0)
+            {
+                maxCorner.z = maxCell.z - 1;
+            }
+
+            var minCenter = tilemap.GetCellCenterWorld(minCorner);
+            var maxCenter = tilemap.GetCellCenterWorld(maxCorner);
+            var halfSize = new Vector3(Mathf.Abs(cellSize.x) * 0.5f, Mathf.Abs(cellSize.y) * 0.5f, Mathf.Abs(cellSize.z) * 0.5f);
+
+            var min = new Vector3(
+                Mathf.Min(minCenter.x - halfSize.x, maxCenter.x - halfSize.x),
+                Mathf.Min(minCenter.y - halfSize.y, maxCenter.y - halfSize.y),
+                Mathf.Min(minCenter.z - halfSize.z, maxCenter.z - halfSize.z));
+
+            var max = new Vector3(
+                Mathf.Max(minCenter.x + halfSize.x, maxCenter.x + halfSize.x),
+                Mathf.Max(minCenter.y + halfSize.y, maxCenter.y + halfSize.y),
+                Mathf.Max(minCenter.z + halfSize.z, maxCenter.z + halfSize.z));
+
+            var center = (min + max) * 0.5f;
+            var size = new Vector3(
+                Mathf.Max(max.x - min.x, Mathf.Abs(cellSize.x)),
+                Mathf.Max(max.y - min.y, Mathf.Abs(cellSize.y)),
+                Mathf.Max(max.z - min.z, Mathf.Abs(cellSize.z)));
+
+            return new Bounds(center, size);
         }
 
         private Vector2 ExtractVelocity(MonoBehaviour behaviour, string context)
@@ -2370,14 +2439,20 @@ namespace AI_Mod.Runtime
         internal ObstacleKind Kind { get; }
     }
 
-    internal readonly struct WallSegment
+    internal readonly struct WallTilemap
     {
-        internal WallSegment(Rect bounds)
+        internal WallTilemap(Tilemap tilemap, Bounds worldBounds, BoundsInt cellBounds, Vector3 cellSize)
         {
-            Bounds = bounds;
+            Tilemap = tilemap;
+            WorldBounds = worldBounds;
+            CellBounds = cellBounds;
+            CellSize = cellSize;
         }
 
-        internal Rect Bounds { get; }
+        internal Tilemap Tilemap { get; }
+        internal Bounds WorldBounds { get; }
+        internal BoundsInt CellBounds { get; }
+        internal Vector3 CellSize { get; }
     }
 
     internal enum ObstacleKind

@@ -125,7 +125,7 @@ namespace AI_Mod.Runtime
             _buffer.Append("Planner Score: ").Append(debug.HasBest ? debug.BestScore.ToString("F2") : "n/a").AppendLine();
             _buffer.Append("Candidates: ").Append(debug.Candidates.Count).AppendLine();
             _buffer.Append("Enemies: ").Append(world.EnemyObstacles.Count).Append(" | Bullets: ").Append(world.BulletObstacles.Count).AppendLine();
-            _buffer.Append("Gems: ").Append(world.Gems.Count).Append(" | Walls: ").Append(world.Walls.Count).AppendLine();
+            _buffer.Append("Gems: ").Append(world.Gems.Count).Append(" | Wall Maps: ").Append(world.WallTilemaps.Count).AppendLine();
             if (debug.HasBest)
             {
                 _buffer.Append("Overlap s (E/B): ")
