@@ -1,3 +1,4 @@
+using AI_Mod.Runtime.Brain;
 using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.Attributes;
 using Il2CppInterop.Runtime.Injection;
@@ -17,6 +18,7 @@ namespace AI_Mod.Runtime
         private readonly AiWorldState _world = new AiWorldState();
         private readonly VelocityObstaclePlanner _planner = new VelocityObstaclePlanner();
         private readonly AiGameStateMonitor _stateMonitor = new AiGameStateMonitor();
+        private readonly KitingPlanner _kitingPlanner = new KitingPlanner();
 
         private CharacterController? _player;
         private Vector2 _desiredDirection = Vector2.zero;
@@ -24,6 +26,7 @@ namespace AI_Mod.Runtime
         private float _lastWorldSyncTime;
         private int _lastPlannedWorldVersion = -1;
         private bool _playerLookupWarned;
+        private bool _kitingFallbackActive;
 
         public AiController(IntPtr pointer) : base(pointer)
         {
@@ -84,7 +87,42 @@ namespace AI_Mod.Runtime
 
             if (_world.Version >= 0 && (worldUpdated || _lastPlannedWorldVersion != _world.Version))
             {
-                var plan = _planner.Plan(_world);
+                var kitingDirective = _kitingPlanner.BuildDirective(_world);
+                var plannerDirective = kitingDirective;
+                string? fallbackMessage = null;
+
+                if (kitingDirective.HasDirective && kitingDirective.FallbackRequested)
+                {
+                    fallbackMessage = "Kiting fallback engaged: orbit lanes blocked. Defaulting to velocity-obstacle escape.";
+                    plannerDirective = KitingDirective.None;
+                }
+
+                var plan = _planner.Plan(_world, plannerDirective);
+
+                if (plannerDirective.HasDirective && plan.Mode == SteeringMode.Fallback && fallbackMessage == null)
+                {
+                    fallbackMessage = "Kiting fallback engaged: no safe orbit alignment. Defaulting to velocity-obstacle escape.";
+                }
+
+                if (fallbackMessage != null)
+                {
+                    if (!_kitingFallbackActive)
+                    {
+                        MelonLogger.Msg(fallbackMessage);
+                    }
+
+                    _kitingFallbackActive = true;
+                }
+                else
+                {
+                    if (_kitingFallbackActive && plan.Mode == SteeringMode.Kiting)
+                    {
+                        MelonLogger.Msg("Kiting fallback cleared; resuming orbit.");
+                    }
+
+                    _kitingFallbackActive = false;
+                }
+
                 _lastPlan = plan;
                 _desiredDirection = plan.Direction;
                 _lastPlannedWorldVersion = _world.Version;
@@ -173,14 +211,24 @@ namespace AI_Mod.Runtime
 
     internal readonly struct PlannerResult
     {
-        internal static readonly PlannerResult Zero = new PlannerResult(Vector2.zero);
+        internal static readonly PlannerResult Zero = new PlannerResult(Vector2.zero, SteeringMode.Idle);
 
-        internal PlannerResult(Vector2 direction)
+        internal PlannerResult(Vector2 direction, SteeringMode mode)
         {
             Direction = direction;
+            Mode = mode;
         }
 
         internal Vector2 Direction { get; }
+        internal SteeringMode Mode { get; }
+    }
+
+    internal enum SteeringMode
+    {
+        Idle,
+        VelocityObstacle,
+        Kiting,
+        Fallback
     }
 
     internal sealed class PlannerDebugInfo
@@ -252,6 +300,10 @@ namespace AI_Mod.Runtime
         private const float GemRewardWeight = 12f;
         private const float GemAttractionDistance = 8f;
         private const float GemAttractionDistanceSquared = GemAttractionDistance * GemAttractionDistance;
+        private const float KitingAlignmentWeight = 12f;
+        private const float KitingRadiusWeight = 8f;
+        private const float KitingOutrunWeight = 6f;
+        private const float KitingAlignmentThreshold = 0.2f;
 
         private readonly PlannerDebugInfo _debugInfo = new PlannerDebugInfo();
         private readonly List<Vector2> _trajectoryScratch = new List<Vector2>(SimulationSteps + 1);
@@ -267,7 +319,7 @@ namespace AI_Mod.Runtime
 
         internal PlannerDebugInfo DebugInfo => _debugInfo;
 
-        internal PlannerResult Plan(AiWorldState world)
+        internal PlannerResult Plan(AiWorldState world, KitingDirective directive)
         {
             _debugInfo.Begin();
 
@@ -297,6 +349,7 @@ namespace AI_Mod.Runtime
             _maxGemRewardPerStep = ComputeMaxGemRewardPerStep(world.Gems);
             var bestScore = float.MinValue;
             var bestDirection = Vector2.zero;
+            var bestAlignment = float.NegativeInfinity;
 
             foreach (var candidate in EnumerateDirections())
             {
@@ -311,6 +364,7 @@ namespace AI_Mod.Runtime
                     _trajectoryScratch,
                     bestScore);
                 var direction = velocity.sqrMagnitude > 0.0001f ? velocity.normalized : Vector2.zero;
+                score += ComputeKitingBonus(direction, directive);
 
                 _debugInfo.RecordCandidate(direction, score);
 
@@ -318,11 +372,34 @@ namespace AI_Mod.Runtime
                 {
                     bestScore = score;
                     bestDirection = direction;
+                    if (directive.HasDirective)
+                    {
+                        bestAlignment = ComputeTangentialAlignment(direction, directive);
+                    }
                     _debugInfo.RecordBest(bestDirection, bestScore, _trajectoryScratch);
                 }
             }
 
-            return bestDirection == Vector2.zero ? PlannerResult.Zero : new PlannerResult(bestDirection);
+            if (bestDirection == Vector2.zero)
+            {
+                return PlannerResult.Zero;
+            }
+
+            if (!directive.HasDirective)
+            {
+                return new PlannerResult(bestDirection, SteeringMode.VelocityObstacle);
+            }
+
+            if (!float.IsFinite(bestAlignment))
+            {
+                bestAlignment = -1f;
+            }
+
+            var mode = bestAlignment >= KitingAlignmentThreshold
+                ? SteeringMode.Kiting
+                : SteeringMode.Fallback;
+
+            return new PlannerResult(bestDirection, mode);
         }
 
         private static IEnumerable<Vector2> EnumerateDirections()
@@ -333,6 +410,59 @@ namespace AI_Mod.Runtime
                 var angle = (Mathf.PI * 2f * i) / DirectionSamples;
                 yield return new Vector2(Mathf.Cos(angle), Mathf.Sin(angle));
             }
+        }
+
+        private float ComputeKitingBonus(Vector2 direction, KitingDirective directive)
+        {
+            if (!directive.HasDirective || direction.sqrMagnitude < 0.0001f)
+            {
+                return 0f;
+            }
+
+            var alignment = ComputeTangentialAlignment(direction, directive);
+            var tangentialScore = alignment * KitingAlignmentWeight;
+
+            var radialComponent = Vector2.Dot(direction, directive.RadialDirection);
+            var radiusDelta = directive.CurrentRadius - directive.PreferredRadius;
+            var radialScore = 0f;
+
+            if (radiusDelta > directive.RadiusTolerance)
+            {
+                radialScore -= radialComponent * KitingRadiusWeight;
+            }
+            else if (radiusDelta < -directive.RadiusTolerance)
+            {
+                radialScore += radialComponent * KitingRadiusWeight;
+            }
+
+            var outrunScore = directive.SwarmOutrunBias > 0f
+                ? directive.SwarmOutrunBias * radialComponent * KitingOutrunWeight
+                : 0f;
+
+            var total = tangentialScore + radialScore + outrunScore;
+            if (!float.IsFinite(total))
+            {
+                return 0f;
+            }
+
+            return total;
+        }
+
+        private static float ComputeTangentialAlignment(Vector2 direction, KitingDirective directive)
+        {
+            if (!directive.HasDirective || direction.sqrMagnitude < 0.0001f)
+            {
+                return -1f;
+            }
+
+            var primary = Vector2.Dot(direction, directive.OrbitDirection);
+            if (!directive.HasAlternateOrbit)
+            {
+                return primary;
+            }
+
+            var alternate = Vector2.Dot(direction, directive.AlternateOrbitDirection);
+            return Mathf.Abs(alternate) > Mathf.Abs(primary) ? alternate : primary;
         }
 
         private float EvaluateCandidate(
