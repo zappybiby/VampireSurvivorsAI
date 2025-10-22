@@ -1264,13 +1264,14 @@ namespace AI_Mod.Runtime
                 return null;
             }
 
-            if (TryLocateIl2CppVectorProperty(type, "Velocity", out var property))
+            if (TryLocateIl2CppVectorProperty(type, "Velocity", out var property) && property != null)
             {
+                var nonNullProperty = property;
                 return (Il2CppSystem.Object instance, out Vector2 value) =>
                 {
                     try
                     {
-                        var raw = property.GetValue(instance, null);
+                        var raw = nonNullProperty.GetValue(instance, null);
                         return TryConvertVector(raw, out value);
                     }
                     catch
@@ -1281,13 +1282,13 @@ namespace AI_Mod.Runtime
                 };
             }
 
-            if (TryLocateIl2CppVectorField(type, "_velocity", out var field))
+            if (TryLocateIl2CppVectorField(type, "_velocity", out var field) && field is Il2CppSystem.Reflection.FieldInfo nonNullField)
             {
                 return (Il2CppSystem.Object instance, out Vector2 value) =>
                 {
                     try
                     {
-                        var raw = field.GetValue(instance);
+                        var raw = nonNullField.GetValue(instance);
                         return TryConvertVector(raw, out value);
                     }
                     catch
