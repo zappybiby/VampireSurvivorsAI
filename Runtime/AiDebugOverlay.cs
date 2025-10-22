@@ -97,7 +97,13 @@ namespace AI_Mod.Runtime
                 return;
             }
 
-            DrawWorldMarkers(controller, camera);
+            if (!TryComputeRenderMapping(camera, out var renderRect, out var sourceSize))
+            {
+                DrawStatusBanner("Render mapping unavailable. TODO: inspect camera render texture.");
+                return;
+            }
+
+            DrawWorldMarkers(controller, camera, renderRect, sourceSize);
         }
 
         private void DrawSummaryPanel(AiController controller)
@@ -148,16 +154,16 @@ namespace AI_Mod.Runtime
             GUI.Label(new Rect(rect.x + 8f, rect.y + 6f, rect.width - 12f, rect.height - 12f), _buffer.ToString(), _labelStyle);
         }
 
-        private void DrawWorldMarkers(AiController controller, Camera camera)
+        private void DrawWorldMarkers(AiController controller, Camera camera, Rect renderRect, Vector2 sourceSize)
         {
             var world = controller.WorldState;
             var debug = controller.PlannerDebug;
 
             Vector2 playerScreen = default;
-            var hasPlayerScreen = world.Player.IsValid && TryWorldToGui(world.Player.Position, camera, out playerScreen);
+            var hasPlayerScreen = world.Player.IsValid && TryWorldToGui(world.Player.Position, camera, renderRect, sourceSize, out playerScreen);
             if (hasPlayerScreen)
             {
-                var radius = ResolveScreenRadius(world.Player.Position, world.Player.Radius, camera, 6f, "OverlayPlayerRadiusFallback", "player marker");
+                var radius = ResolveScreenRadius(world.Player.Position, world.Player.Radius, camera, renderRect, sourceSize, 6f, "OverlayPlayerRadiusFallback", "player marker");
                 DrawDisc(playerScreen, radius, _playerColor);
                 if (debug.HasBest && debug.BestDirection.sqrMagnitude > 0.0001f)
                 {
@@ -171,7 +177,7 @@ namespace AI_Mod.Runtime
                 var encirclement = world.Encirclement;
                 if (encirclement.HasRing && encirclement.RingRadius > 0f)
                 {
-                    var ringPixels = ResolveScreenRadius(world.Player.Position, encirclement.RingRadius, camera, 12f, "OverlayEncirclementRadiusFallback", "encirclement ring");
+                    var ringPixels = ResolveScreenRadius(world.Player.Position, encirclement.RingRadius, camera, renderRect, sourceSize, 12f, "OverlayEncirclementRadiusFallback", "encirclement ring");
                     if (ringPixels > 0f)
                     {
                         DrawCircle(playerScreen, ringPixels, _breakoutColor, 40);
@@ -188,15 +194,15 @@ namespace AI_Mod.Runtime
 
             if (debug.HasBest)
             {
-                DrawTrajectory(debug.BestTrajectory, camera, _pathColor);
+                DrawTrajectory(debug.BestTrajectory, camera, _pathColor, renderRect, sourceSize);
             }
 
             for (var i = 0; i < world.EnemyObstacles.Count; i++)
             {
                 var obstacle = world.EnemyObstacles[i];
-                if (TryWorldToGui(obstacle.Position, camera, out var enemyScreen))
+                if (TryWorldToGui(obstacle.Position, camera, renderRect, sourceSize, out var enemyScreen))
                 {
-                    var radius = ResolveScreenRadius(obstacle.Position, obstacle.Radius, camera, 4f, "OverlayEnemyRadiusFallback", "enemy marker");
+                    var radius = ResolveScreenRadius(obstacle.Position, obstacle.Radius, camera, renderRect, sourceSize, 4f, "OverlayEnemyRadiusFallback", "enemy marker");
                     DrawDisc(enemyScreen, radius, _enemyColor);
                 }
             }
@@ -204,9 +210,9 @@ namespace AI_Mod.Runtime
             for (var i = 0; i < world.BulletObstacles.Count; i++)
             {
                 var obstacle = world.BulletObstacles[i];
-                if (TryWorldToGui(obstacle.Position, camera, out var bulletScreen))
+                if (TryWorldToGui(obstacle.Position, camera, renderRect, sourceSize, out var bulletScreen))
                 {
-                    var radius = ResolveScreenRadius(obstacle.Position, obstacle.Radius, camera, 3f, "OverlayBulletRadiusFallback", "bullet marker");
+                    var radius = ResolveScreenRadius(obstacle.Position, obstacle.Radius, camera, renderRect, sourceSize, 3f, "OverlayBulletRadiusFallback", "bullet marker");
                     DrawDisc(bulletScreen, radius, _bulletColor);
                 }
             }
@@ -219,9 +225,9 @@ namespace AI_Mod.Runtime
                     continue;
                 }
 
-                if (TryWorldToGui(gem.Position, camera, out var gemScreen))
+                if (TryWorldToGui(gem.Position, camera, renderRect, sourceSize, out var gemScreen))
                 {
-                    var radius = ResolveScreenRadius(gem.Position, gem.Radius, camera, 3f, "OverlayGemRadiusFallback", "gem marker");
+                    var radius = ResolveScreenRadius(gem.Position, gem.Radius, camera, renderRect, sourceSize, 3f, "OverlayGemRadiusFallback", "gem marker");
                     DrawDisc(gemScreen, radius, _gemColor);
                 }
             }
@@ -247,7 +253,7 @@ namespace AI_Mod.Runtime
         }
 
         [HideFromIl2Cpp]
-        private void DrawTrajectory(IReadOnlyList<Vector2> trajectory, Camera camera, Color color)
+        private void DrawTrajectory(IReadOnlyList<Vector2> trajectory, Camera camera, Color color, Rect renderRect, Vector2 sourceSize)
         {
             if (trajectory == null || trajectory.Count < 2)
             {
@@ -258,7 +264,7 @@ namespace AI_Mod.Runtime
             for (var i = 0; i < trajectory.Count; i++)
             {
                 var node = trajectory[i];
-                if (!TryWorldToGui(node, camera, out var screen))
+                if (!TryWorldToGui(node, camera, renderRect, sourceSize, out var screen))
                 {
                     previous = null;
                     continue;
@@ -385,9 +391,64 @@ namespace AI_Mod.Runtime
             _fallbacks.WarnOnce("CameraUnavailable", "No active camera located for overlay rendering.");
         }
 
-        private float ResolveScreenRadius(Vector2 worldPos, float worldRadius, Camera camera, float minimumPixels, string fallbackKey, string description)
+        private bool TryComputeRenderMapping(Camera camera, out Rect renderRect, out Vector2 sourceSize)
         {
-            if (TryWorldRadiusToPixels(worldPos, worldRadius, camera, out var pixels))
+            renderRect = default;
+            sourceSize = default;
+
+            var screenWidth = (float)Screen.width;
+            var screenHeight = (float)Screen.height;
+            if (screenWidth <= 0f || screenHeight <= 0f)
+            {
+                _fallbacks.WarnOnce("OverlayScreenSizeInvalid", $"Screen dimensions invalid ({screenWidth}x{screenHeight}).");
+                return false;
+            }
+
+            float sourceWidth;
+            float sourceHeight;
+
+            var target = camera.targetTexture;
+            if (target != null)
+            {
+                sourceWidth = target.width;
+                sourceHeight = target.height;
+            }
+            else if (camera.pixelWidth > 0 && camera.pixelHeight > 0)
+            {
+                sourceWidth = camera.pixelWidth;
+                sourceHeight = camera.pixelHeight;
+                _fallbacks.InfoOnce("OverlayTargetTextureMissing", "Camera targetTexture missing; using pixelWidth/Height fallback for overlay mapping.");
+            }
+            else
+            {
+                sourceWidth = screenWidth;
+                sourceHeight = screenHeight;
+                _fallbacks.WarnOnce("OverlaySourceSizeFallbackScreen", "Unable to resolve camera render dimensions; falling back to Screen dimensions for overlay mapping.");
+            }
+
+            if (sourceWidth <= 0f || sourceHeight <= 0f)
+            {
+                _fallbacks.WarnOnce("OverlaySourceSizeInvalid", $"Camera render dimensions invalid ({sourceWidth}x{sourceHeight}).");
+                return false;
+            }
+
+            var widthScale = screenWidth / sourceWidth;
+            var heightScale = screenHeight / sourceHeight;
+            var scale = Mathf.Min(widthScale, heightScale);
+
+            var mappedWidth = sourceWidth * scale;
+            var mappedHeight = sourceHeight * scale;
+            var offsetX = (screenWidth - mappedWidth) * 0.5f;
+            var offsetY = (screenHeight - mappedHeight) * 0.5f;
+
+            renderRect = new Rect(offsetX, offsetY, mappedWidth, mappedHeight);
+            sourceSize = new Vector2(sourceWidth, sourceHeight);
+            return true;
+        }
+
+        private float ResolveScreenRadius(Vector2 worldPos, float worldRadius, Camera camera, Rect renderRect, Vector2 sourceSize, float minimumPixels, string fallbackKey, string description)
+        {
+            if (TryWorldRadiusToPixels(worldPos, worldRadius, camera, renderRect, sourceSize, out var pixels))
             {
                 return Mathf.Max(minimumPixels, pixels);
             }
@@ -409,7 +470,7 @@ namespace AI_Mod.Runtime
             return texture;
         }
 
-        private static bool TryWorldToGui(Vector2 worldPos, Camera camera, out Vector2 guiPos)
+        private static bool TryWorldToGui(Vector2 worldPos, Camera camera, Rect renderRect, Vector2 sourceSize, out Vector2 guiPos)
         {
             var screen = camera.WorldToScreenPoint(new Vector3(worldPos.x, worldPos.y, 0f));
             if (screen.z < 0f)
@@ -418,11 +479,21 @@ namespace AI_Mod.Runtime
                 return false;
             }
 
-            guiPos = new Vector2(screen.x, Screen.height - screen.y);
+            if (sourceSize.x <= 0f || sourceSize.y <= 0f || renderRect.width <= 0f || renderRect.height <= 0f)
+            {
+                guiPos = Vector2.zero;
+                return false;
+            }
+
+            var normalizedX = screen.x / sourceSize.x;
+            var normalizedY = screen.y / sourceSize.y;
+            var x = renderRect.x + normalizedX * renderRect.width;
+            var y = renderRect.y + (1f - normalizedY) * renderRect.height;
+            guiPos = new Vector2(x, y);
             return true;
         }
 
-        private static bool TryWorldRadiusToPixels(Vector2 worldPos, float radius, Camera camera, out float pixelRadius)
+        private static bool TryWorldRadiusToPixels(Vector2 worldPos, float radius, Camera camera, Rect renderRect, Vector2 sourceSize, out float pixelRadius)
         {
             pixelRadius = 0f;
             if (radius <= 0f)
@@ -430,8 +501,8 @@ namespace AI_Mod.Runtime
                 return false;
             }
 
-            if (!TryWorldToGui(worldPos, camera, out var center) ||
-                !TryWorldToGui(worldPos + new Vector2(radius, 0f), camera, out var edge))
+            if (!TryWorldToGui(worldPos, camera, renderRect, sourceSize, out var center) ||
+                !TryWorldToGui(worldPos + new Vector2(radius, 0f), camera, renderRect, sourceSize, out var edge))
             {
                 return false;
             }
