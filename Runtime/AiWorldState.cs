@@ -138,31 +138,23 @@ namespace AI_Mod.Runtime
             _enemies.Clear();
 
             var stage = EnsureStageReference();
-            if (stage != null && !stage.Equals(null))
+            if (stage == null || stage.Equals(null))
             {
-                var roster = stage.SpawnedEnemies;
-                if (roster != null && !roster.Equals(null))
-                {
-                    var count = roster.Count;
-                    for (var i = 0; i < count; i++)
-                    {
-                        var enemy = roster[i];
-                        AppendEnemyObstacle(enemy);
-                    }
-
-                    return;
-                }
-
-                _fallbacks.WarnOnce("StageSpawnedEnemiesFallback", "Stage.SpawnedEnemies unavailable; using global enemy scan fallback.");
-            }
-            else
-            {
-                _fallbacks.WarnOnce("StageLookupFallback", "Stage component not found; using global enemy scan fallback.");
+                _fallbacks.WarnOnce("StageLookupFailed", "Stage component not found; enemy roster unavailable.");
+                return;
             }
 
-            var enemies = UnityEngine.Object.FindObjectsOfType<EnemyController>(true);
-            foreach (var enemy in enemies)
+            var roster = stage.SpawnedEnemies;
+            if (roster == null || roster.Equals(null))
             {
+                _fallbacks.WarnOnce("StageSpawnedEnemiesMissing", "Stage.SpawnedEnemies unavailable; enemy roster unavailable.");
+                return;
+            }
+
+            var count = roster.Count;
+            for (var i = 0; i < count; i++)
+            {
+                var enemy = roster[i];
                 AppendEnemyObstacle(enemy);
             }
         }
@@ -191,11 +183,9 @@ namespace AI_Mod.Runtime
         {
             _bullets.Clear();
 
-            var collectedFromPooler = TryCollectBulletsFromPooler();
-            if (!collectedFromPooler)
+            if (!TryCollectBulletsFromPooler())
             {
-                _fallbacks.WarnOnce("BulletPoolFallback", "Bullet pools unavailable; using scene scan fallback.");
-                CollectBulletsViaSceneScan();
+                _fallbacks.WarnOnce("BulletPoolUnavailable", "Bullet pools unavailable; no bullets collected this frame.");
             }
 
             if (_bullets.Count == 0)
@@ -203,7 +193,6 @@ namespace AI_Mod.Runtime
                 _fallbacks.InfoOnce("BulletScanEmpty", "No active bullets detected; planner continues without projectile avoidance.");
             }
         }
-
         private bool TryCollectBulletsFromPooler()
         {
             if (!EnsureBulletPoolBindings())
@@ -229,51 +218,6 @@ namespace AI_Mod.Runtime
 
             return success;
         }
-
-        private void CollectBulletsViaSceneScan()
-        {
-            foreach (var bulletType in BulletTypeCatalog.Types)
-            {
-                var raw = UnityEngine.Object.FindObjectsOfType(bulletType, true);
-                for (var i = 0; i < raw.Length; i++)
-                {
-                    var component = raw[i];
-                    if (component == null)
-                    {
-                        continue;
-                    }
-
-                    var behaviour = component.TryCast<MonoBehaviour>();
-                    if (behaviour == null || behaviour.gameObject == null || !behaviour.gameObject.activeInHierarchy)
-                    {
-                        continue;
-                    }
-
-                    AppendBulletFromBehaviour(behaviour);
-                }
-            }
-        }
-
-        private void AppendBulletFromBehaviour(MonoBehaviour behaviour)
-        {
-            if (behaviour == null || behaviour.Equals(null))
-            {
-                return;
-            }
-
-            var go = behaviour.gameObject;
-            if (go == null || go.Equals(null) || !go.activeInHierarchy)
-            {
-                return;
-            }
-
-            var position = behaviour.transform.position;
-            var velocity = ExtractVelocity(behaviour, "Bullet");
-            var radius = EstimateRadius(go, "Bullet");
-
-            _bullets.Add(new DynamicObstacle(position, velocity, radius, ObstacleKind.Bullet));
-        }
-
         private bool EnsureBulletPoolBindings()
         {
             if (_bulletPoolsInitialized)
@@ -299,7 +243,7 @@ namespace AI_Mod.Runtime
             }
             catch (TypeInitializationException ex)
             {
-                _fallbacks.WarnOnce("BulletPoolSingletonFailure", $"MasterObjectPooler.Instance threw TypeInitializationException: {ex.Message}. Using fallback.");
+                _fallbacks.WarnOnce("BulletPoolSingletonFailure", $"MasterObjectPooler.Instance threw TypeInitializationException: {ex.Message}. Bullet data unavailable.");
                 return false;
             }
 
@@ -311,7 +255,7 @@ namespace AI_Mod.Runtime
             var poolTable = pooler.PoolTable;
             if (poolTable == null || poolTable.Equals(null))
             {
-                _fallbacks.WarnOnce("BulletPoolTableMissing", "MasterObjectPooler.PoolTable unavailable; falling back to scene scan.");
+                _fallbacks.WarnOnce("BulletPoolTableMissing", "MasterObjectPooler.PoolTable unavailable; bullet data unavailable.");
                 return false;
             }
 
@@ -339,7 +283,7 @@ namespace AI_Mod.Runtime
 
             if (_bulletPools.Count == 0)
             {
-                _fallbacks.WarnOnce("BulletPoolListEmpty", "No bullet pools discovered in MasterObjectPooler; using fallback.");
+                _fallbacks.WarnOnce("BulletPoolListEmpty", "No bullet pools discovered in MasterObjectPooler; bullet data unavailable.");
                 return false;
             }
 
@@ -482,7 +426,7 @@ namespace AI_Mod.Runtime
                     var poolType = pool.GetIl2CppType();
                     if (poolType == null)
                     {
-                        owner._fallbacks.WarnOnce($"BulletPoolTypeMissing:{poolName}", $"Unable to resolve type metadata for bullet pool '{poolName}'; using fallback.");
+                        owner._fallbacks.WarnOnce($"BulletPoolTypeMissing:{poolName}", $"Unable to resolve type metadata for bullet pool '{poolName}'; skipping pool.");
                         return null;
                     }
 
@@ -491,7 +435,7 @@ namespace AI_Mod.Runtime
                         Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic);
                     if (aliveField == null)
                     {
-                        owner._fallbacks.WarnOnce($"BulletPoolAliveMissing:{poolName}", $"Bullet pool '{poolName}' missing _aliveObjects field; using fallback.");
+                        owner._fallbacks.WarnOnce($"BulletPoolAliveMissing:{poolName}", $"Bullet pool '{poolName}' missing _aliveObjects field; skipping pool.");
                         return null;
                     }
 
@@ -499,7 +443,7 @@ namespace AI_Mod.Runtime
                 }
                 catch (Exception ex)
                 {
-                    owner._fallbacks.WarnOnce($"BulletPoolBindingException:{poolName}", $"Encountered exception while preparing bullet pool '{poolName}': {ex.Message}. Using fallback.");
+                    owner._fallbacks.WarnOnce($"BulletPoolBindingException:{poolName}", $"Encountered exception while preparing bullet pool '{poolName}': {ex.Message}. Skipping pool.");
                     return null;
                 }
             }
@@ -510,7 +454,7 @@ namespace AI_Mod.Runtime
             {
                 if (_pool == null || _pool.Equals(null))
                 {
-                    owner._fallbacks.WarnOnce($"BulletPoolInvalid:{_poolName}", $"Bullet pool '{_poolName}' no longer valid; forcing fallback.");
+                    owner._fallbacks.WarnOnce($"BulletPoolInvalid:{_poolName}", $"Bullet pool '{_poolName}' no longer valid; clearing binding.");
                     return false;
                 }
 
@@ -521,7 +465,7 @@ namespace AI_Mod.Runtime
                 }
                 catch (Exception ex)
                 {
-                    owner._fallbacks.WarnOnce($"BulletPoolAliveAccess:{_poolName}", $"Failed to access _aliveObjects for pool '{_poolName}': {ex.Message}. Using fallback.");
+                    owner._fallbacks.WarnOnce($"BulletPoolAliveAccess:{_poolName}", $"Failed to access _aliveObjects for pool '{_poolName}': {ex.Message}. Bullet data omitted.");
                     return false;
                 }
 
@@ -535,7 +479,7 @@ namespace AI_Mod.Runtime
                     return true;
                 }
 
-                owner._fallbacks.WarnOnce($"BulletPoolAliveUnexpected:{_poolName}", $"Bullet pool '{_poolName}' returned unsupported _aliveObjects type; using fallback.");
+                owner._fallbacks.WarnOnce($"BulletPoolAliveUnexpected:{_poolName}", $"Bullet pool '{_poolName}' returned unsupported _aliveObjects type; skipping pool entries.");
                 return false;
             }
 
@@ -667,7 +611,7 @@ namespace AI_Mod.Runtime
 
             if (!TryCollectGemsFromPooler())
             {
-                CollectGemsViaSceneScan();
+                _fallbacks.WarnOnce("GemPoolUnavailable", "Gem pool unavailable; no gems collected this frame.");
             }
         }
 
@@ -680,7 +624,7 @@ namespace AI_Mod.Runtime
             }
             catch (TypeInitializationException ex)
             {
-                _fallbacks.WarnOnce("GemPoolSingletonFailure", $"MasterObjectPooler.Instance threw TypeInitializationException: {ex.Message}. Using fallback.");
+                _fallbacks.WarnOnce("GemPoolSingletonFailure", $"MasterObjectPooler.Instance threw TypeInitializationException: {ex.Message}. Gem data unavailable.");
                 return false;
             }
 
@@ -692,7 +636,7 @@ namespace AI_Mod.Runtime
             var poolTable = pooler.PoolTable;
             if (poolTable == null || poolTable.Equals(null))
             {
-                _fallbacks.WarnOnce("GemPoolTableMissing", "MasterObjectPooler.PoolTable unavailable; falling back to scene scan.");
+                _fallbacks.WarnOnce("GemPoolTableMissing", "MasterObjectPooler.PoolTable unavailable; gem data unavailable.");
                 return false;
             }
 
@@ -718,7 +662,7 @@ namespace AI_Mod.Runtime
             var poolType = gemsPool.GetIl2CppType();
             if (poolType == null)
             {
-                _fallbacks.WarnOnce("GemPoolTypeLookupFailed", "Unable to resolve gem pool type metadata; using fallback.");
+                _fallbacks.WarnOnce("GemPoolTypeLookupFailed", "Unable to resolve gem pool type metadata; skipping gem pool.");
                 return false;
             }
 
@@ -727,7 +671,7 @@ namespace AI_Mod.Runtime
                 Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic);
             if (aliveField == null)
             {
-                _fallbacks.WarnOnce("GemPoolAliveFieldMissing", "Gem pool missing _aliveObjects field; using fallback.");
+                _fallbacks.WarnOnce("GemPoolAliveFieldMissing", "Gem pool missing _aliveObjects field; skipping gem pool.");
                 return false;
             }
 
@@ -738,7 +682,7 @@ namespace AI_Mod.Runtime
             }
             catch (Exception ex)
             {
-                _fallbacks.WarnOnce("GemPoolAliveAccessError", $"Exception while accessing gem pool _aliveObjects: {ex.Message}. Using scene scan fallback.");
+                _fallbacks.WarnOnce("GemPoolAliveAccessError", $"Exception while accessing gem pool _aliveObjects: {ex.Message}. Gem data unavailable.");
                 return false;
             }
 
@@ -754,42 +698,9 @@ namespace AI_Mod.Runtime
 
             var aliveIl2Type = (aliveValue as Il2CppSystem.Object)?.GetIl2CppType();
             var typeName = aliveIl2Type != null ? (string?)aliveIl2Type.FullName : "unknown";
-            _fallbacks.WarnOnce("GemPoolAliveDictionaryUnexpected", $"Gem pool _aliveObjects had unexpected type '{typeName ?? "unknown"}'; using scene scan fallback.");
+            _fallbacks.WarnOnce("GemPoolAliveDictionaryUnexpected", $"Gem pool _aliveObjects had unexpected type '{typeName ?? "unknown"}'; gem data unavailable.");
             return false;
         }
-
-        private void CollectGemsViaSceneScan()
-        {
-            var gems = UnityEngine.Object.FindObjectsOfType<Gem>(true);
-            foreach (var gem in gems)
-            {
-                AppendGemFromComponent(gem);
-            }
-        }
-
-        private void AppendGemFromComponent(Gem? gem)
-        {
-            if (gem == null || gem.Equals(null))
-            {
-                return;
-            }
-
-            var go = gem.gameObject;
-            if (go == null || go.Equals(null))
-            {
-                return;
-            }
-
-            var transform = gem.transform;
-            if (transform == null || transform.Equals(null))
-            {
-                _fallbacks.WarnOnce("GemSceneTransformMissing", "Gem component missing transform; skipping entry.");
-                return;
-            }
-
-            AppendGemSnapshot(go, transform.position, go.activeInHierarchy);
-        }
-
         private void AppendGemFromPoolObject(GameObject? go)
         {
             if (go == null || go.Equals(null))
@@ -1785,15 +1696,6 @@ namespace AI_Mod.Runtime
     {
         Enemy,
         Bullet
-    }
-
-    internal static class BulletTypeCatalog
-    {
-        internal static readonly Il2CppSystem.Type[] Types =
-        {
-            Il2CppType.Of<Il2CppVampireSurvivors.Objects.Characters.Enemies.EnemyBullet1>(),
-            Il2CppType.Of<Il2CppVampireSurvivors.Objects.Characters.Enemies.EnemyBulletW>(),
-        };
     }
 
     internal sealed class FallbackLogger
