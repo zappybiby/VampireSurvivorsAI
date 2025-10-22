@@ -24,6 +24,7 @@ namespace AI_Mod.Runtime
         private readonly Color _bulletColor = new Color(1f, 0.65f, 0.1f, 0.9f);
         private readonly Color _gemColor = new Color(0.2f, 0.95f, 0.2f, 0.95f);
         private readonly Color _playerColor = new Color(0.95f, 0.95f, 0.95f, 0.95f);
+        private readonly Color _breakoutColor = new Color(1f, 0.35f, 0.6f, 0.95f);
         private readonly StringBuilder _buffer = new StringBuilder(256);
         private readonly FallbackLogger _fallbacks = new FallbackLogger();
 
@@ -104,6 +105,7 @@ namespace AI_Mod.Runtime
             var world = controller.WorldState;
             var debug = controller.PlannerDebug;
             var planDirection = controller.LastPlan.Direction;
+            var encirclement = world.Encirclement;
 
             _buffer.Clear();
             _buffer.AppendLine("AI Debug Overlay");
@@ -113,12 +115,34 @@ namespace AI_Mod.Runtime
             _buffer.Append("Player Pos: ").Append(world.Player.Position.x.ToString("F2")).Append(", ").Append(world.Player.Position.y.ToString("F2")).AppendLine();
             _buffer.Append("Player Vel: ").Append(world.Player.Velocity.x.ToString("F2")).Append(", ").Append(world.Player.Velocity.y.ToString("F2")).AppendLine();
             _buffer.Append("Desired Dir: ").Append(planDirection.x.ToString("F2")).Append(", ").Append(planDirection.y.ToString("F2")).AppendLine();
+            _buffer.Append("Plan Mode: ").Append(controller.LastPlan.Mode).AppendLine();
             _buffer.Append("Planner Score: ").Append(debug.HasBest ? debug.BestScore.ToString("F2") : "n/a").AppendLine();
             _buffer.Append("Candidates: ").Append(debug.Candidates.Count).AppendLine();
             _buffer.Append("Enemies: ").Append(world.EnemyObstacles.Count).Append(" | Bullets: ").Append(world.BulletObstacles.Count).AppendLine();
             _buffer.Append("Gems: ").Append(world.Gems.Count).Append(" | Walls: ").Append(world.Walls.Count).AppendLine();
+            if (debug.HasBest)
+            {
+                _buffer.Append("Overlap s (E/B): ")
+                    .Append(debug.BestEnemyOverlapSeconds.ToString("F3")).Append(" / ")
+                    .Append(debug.BestBulletOverlapSeconds.ToString("F3")).AppendLine();
+            }
+            _buffer.Append("Encircled: ").Append(encirclement.HasRing).Append(" | Intensity: ").Append(encirclement.Intensity.ToString("F2")).AppendLine();
+            if (debug.HasBest)
+            {
+                _buffer.Append("Breakout Active: ").Append(debug.BreakoutActive)
+                    .Append(" | Exit t: ");
+                if (float.IsPositiveInfinity(debug.BestBreakoutExitTime))
+                {
+                    _buffer.Append("n/a");
+                }
+                else
+                {
+                    _buffer.Append(debug.BestBreakoutExitTime.ToString("F2"));
+                }
+                _buffer.AppendLine();
+            }
 
-            var panelHeight = 170f;
+            var panelHeight = 210f;
             var rect = new Rect(PanelMargin, PanelMargin, PanelWidth, panelHeight);
             DrawFilledRect(rect, _panelColor);
             GUI.Label(new Rect(rect.x + 8f, rect.y + 6f, rect.width - 12f, rect.height - 12f), _buffer.ToString(), _labelStyle);
@@ -129,7 +153,9 @@ namespace AI_Mod.Runtime
             var world = controller.WorldState;
             var debug = controller.PlannerDebug;
 
-            if (world.Player.IsValid && TryWorldToGui(world.Player.Position, camera, out var playerScreen))
+            Vector2 playerScreen = default;
+            var hasPlayerScreen = world.Player.IsValid && TryWorldToGui(world.Player.Position, camera, out playerScreen);
+            if (hasPlayerScreen)
             {
                 var radius = ResolveScreenRadius(world.Player.Position, world.Player.Radius, camera, 6f, "OverlayPlayerRadiusFallback", "player marker");
                 DrawDisc(playerScreen, radius, _playerColor);
@@ -140,6 +166,23 @@ namespace AI_Mod.Runtime
                     const float arrowLength = 65f;
                     var pathEnd = pathStart + direction * arrowLength;
                     DrawLine(pathStart, pathEnd, _pathColor, LineThickness);
+                }
+
+                var encirclement = world.Encirclement;
+                if (encirclement.HasRing && encirclement.RingRadius > 0f)
+                {
+                    var ringPixels = ResolveScreenRadius(world.Player.Position, encirclement.RingRadius, camera, 12f, "OverlayEncirclementRadiusFallback", "encirclement ring");
+                    if (ringPixels > 0f)
+                    {
+                        DrawCircle(playerScreen, ringPixels, _breakoutColor, 40);
+                        if (encirclement.HasBreakoutDirection)
+                        {
+                            var breakoutLength = Mathf.Max(ringPixels + 30f, 60f);
+                            var breakoutEnd = playerScreen + encirclement.BreakoutDirection * breakoutLength;
+                            DrawLine(playerScreen, breakoutEnd, _breakoutColor, LineThickness * 1.1f);
+                            DrawDisc(breakoutEnd, 6f, _breakoutColor);
+                        }
+                    }
                 }
             }
 
@@ -183,6 +226,24 @@ namespace AI_Mod.Runtime
                 }
             }
 
+        }
+
+        private void DrawCircle(Vector2 center, float radius, Color color, int segments)
+        {
+            if (_pixel == null || radius <= 0f || segments < 3)
+            {
+                return;
+            }
+
+            var previous = center + new Vector2(radius, 0f);
+            var step = (Mathf.PI * 2f) / segments;
+            for (var i = 1; i <= segments; i++)
+            {
+                var angle = step * i;
+                var current = center + new Vector2(Mathf.Cos(angle) * radius, Mathf.Sin(angle) * radius);
+                DrawLine(previous, current, color, LineThickness * 0.6f);
+                previous = current;
+            }
         }
 
         [HideFromIl2Cpp]

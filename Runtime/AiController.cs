@@ -27,6 +27,7 @@ namespace AI_Mod.Runtime
         private int _lastPlannedWorldVersion = -1;
         private bool _playerLookupWarned;
         private bool _kitingFallbackActive;
+        private bool _breakoutActive;
 
         public AiController(IntPtr pointer) : base(pointer)
         {
@@ -59,6 +60,7 @@ namespace AI_Mod.Runtime
                 _desiredDirection = Vector2.zero;
                 _world.ClearTransient();
                 _lastPlannedWorldVersion = -1;
+                _breakoutActive = false;
             }
         }
 
@@ -97,7 +99,7 @@ namespace AI_Mod.Runtime
                     plannerDirective = KitingDirective.None;
                 }
 
-                var plan = _planner.Plan(_world, plannerDirective);
+                var plan = _planner.Plan(_world, plannerDirective, _world.Encirclement);
 
                 if (plannerDirective.HasDirective && plan.Mode == SteeringMode.Fallback && fallbackMessage == null)
                 {
@@ -126,6 +128,20 @@ namespace AI_Mod.Runtime
                 _lastPlan = plan;
                 _desiredDirection = plan.Direction;
                 _lastPlannedWorldVersion = _world.Version;
+
+                if (plan.Mode == SteeringMode.Breakout)
+                {
+                    if (!_breakoutActive)
+                    {
+                        MelonLogger.Msg($"Breakout engaged. Encirclement intensity {_world.Encirclement.Intensity:F2}.");
+                    }
+                    _breakoutActive = true;
+                }
+                else if (_breakoutActive)
+                {
+                    MelonLogger.Msg("Breakout cleared.");
+                    _breakoutActive = false;
+                }
             }
         }
 
@@ -228,7 +244,8 @@ namespace AI_Mod.Runtime
         Idle,
         VelocityObstacle,
         Kiting,
-        Fallback
+        Fallback,
+        Breakout
     }
 
     internal sealed class PlannerDebugInfo
@@ -238,12 +255,23 @@ namespace AI_Mod.Runtime
         private float _bestScore = float.MinValue;
         private Vector2 _bestDirection = Vector2.zero;
         private bool _hasBest;
+        private float _bestEnemyOverlapSeconds;
+        private float _bestBulletOverlapSeconds;
+        private float _bestBreakoutExitTime;
+        private bool _bestBreakoutActive;
+        private float _encirclementIntensity;
 
         internal IReadOnlyList<PlannerCandidate> Candidates => _candidates;
         internal IReadOnlyList<Vector2> BestTrajectory => _bestTrajectory;
         internal float BestScore => _hasBest ? _bestScore : float.MinValue;
         internal Vector2 BestDirection => _hasBest ? _bestDirection : Vector2.zero;
         internal bool HasBest => _hasBest;
+        internal float BestEnemyOverlapSeconds => _hasBest ? _bestEnemyOverlapSeconds : 0f;
+        internal float BestBulletOverlapSeconds => _hasBest ? _bestBulletOverlapSeconds : 0f;
+        internal float BestTotalOverlapSeconds => _hasBest ? _bestEnemyOverlapSeconds + _bestBulletOverlapSeconds : 0f;
+        internal float BestBreakoutExitTime => _hasBest ? _bestBreakoutExitTime : float.PositiveInfinity;
+        internal bool BreakoutActive => _hasBest && _bestBreakoutActive;
+        internal float EncirclementIntensity => _hasBest ? _encirclementIntensity : 0f;
 
         internal void Begin()
         {
@@ -252,18 +280,36 @@ namespace AI_Mod.Runtime
             _bestDirection = Vector2.zero;
             _bestScore = float.MinValue;
             _hasBest = false;
+            _bestEnemyOverlapSeconds = 0f;
+            _bestBulletOverlapSeconds = 0f;
+            _bestBreakoutExitTime = float.PositiveInfinity;
+            _bestBreakoutActive = false;
+            _encirclementIntensity = 0f;
         }
 
-        internal void RecordCandidate(Vector2 direction, float score)
+        internal void RecordCandidate(Vector2 direction, float score, float enemyOverlapSeconds, float bulletOverlapSeconds)
         {
-            _candidates.Add(new PlannerCandidate(direction, score));
+            _candidates.Add(new PlannerCandidate(direction, score, enemyOverlapSeconds, bulletOverlapSeconds));
         }
 
-        internal void RecordBest(Vector2 direction, float score, IReadOnlyList<Vector2> trajectory)
+        internal void RecordBest(
+            Vector2 direction,
+            float score,
+            IReadOnlyList<Vector2> trajectory,
+            float enemyOverlapSeconds,
+            float bulletOverlapSeconds,
+            float breakoutExitTime,
+            bool breakoutActive,
+            float encirclementIntensity)
         {
             _bestDirection = direction;
             _bestScore = score;
             _hasBest = true;
+            _bestEnemyOverlapSeconds = enemyOverlapSeconds;
+            _bestBulletOverlapSeconds = bulletOverlapSeconds;
+            _bestBreakoutExitTime = breakoutExitTime;
+            _bestBreakoutActive = breakoutActive;
+            _encirclementIntensity = encirclementIntensity;
 
             _bestTrajectory.Clear();
             if (trajectory != null)
@@ -278,14 +324,18 @@ namespace AI_Mod.Runtime
 
     internal readonly struct PlannerCandidate
     {
-        internal PlannerCandidate(Vector2 direction, float score)
+        internal PlannerCandidate(Vector2 direction, float score, float enemyOverlapSeconds, float bulletOverlapSeconds)
         {
             Direction = direction;
             Score = score;
+            EnemyOverlapSeconds = enemyOverlapSeconds;
+            BulletOverlapSeconds = bulletOverlapSeconds;
         }
 
         internal Vector2 Direction { get; }
         internal float Score { get; }
+        internal float EnemyOverlapSeconds { get; }
+        internal float BulletOverlapSeconds { get; }
     }
 
     internal sealed class VelocityObstaclePlanner
@@ -293,11 +343,12 @@ namespace AI_Mod.Runtime
         private const int DirectionSamples = 20;
         private const float SimulationStep = 0.1f;
         private const int SimulationSteps = 8;
+        private const float SimulationDuration = SimulationSteps * SimulationStep;
         private const float MinimumSeparation = 1.5f;
-        private const float EnemyPenaltyWeight = 40f;
-        private const float BulletPenaltyWeight = 40f;
         private const float WallPenaltyWeight = 60f;
         private const float GemRewardWeight = 12f;
+        private const float OverlapPenaltyScale = GemRewardWeight;
+        private const float BreakoutRewardScale = GemRewardWeight;
         private const float GemAttractionDistance = 8f;
         private const float GemAttractionDistanceSquared = GemAttractionDistance * GemAttractionDistance;
         private const float KitingAlignmentWeight = 12f;
@@ -319,7 +370,7 @@ namespace AI_Mod.Runtime
 
         internal PlannerDebugInfo DebugInfo => _debugInfo;
 
-        internal PlannerResult Plan(AiWorldState world, KitingDirective directive)
+        internal PlannerResult Plan(AiWorldState world, KitingDirective directive, EncirclementSnapshot encirclement)
         {
             _debugInfo.Begin();
 
@@ -332,6 +383,7 @@ namespace AI_Mod.Runtime
             var origin = world.Player.Position;
             var playerRadius = world.Player.Radius;
             var playerSafeRadius = playerRadius + MinimumSeparation;
+            var gemScale = Mathf.Clamp01(1f - encirclement.Intensity);
             PrepareDynamicObstacleCache(
                 world.EnemyObstacles,
                 _enemyProjectedPositions,
@@ -346,37 +398,59 @@ namespace AI_Mod.Runtime
                 ref _bulletCombinedRadiiSquared,
                 playerSafeRadius,
                 out _bulletCount);
-            _maxGemRewardPerStep = ComputeMaxGemRewardPerStep(world.Gems);
+            _maxGemRewardPerStep = ComputeMaxGemRewardPerStep(world.Gems, gemScale);
             var bestScore = float.MinValue;
             var bestDirection = Vector2.zero;
             var bestAlignment = float.NegativeInfinity;
+            var breakoutPreferred = false;
+            var bestBreakoutExitTime = float.PositiveInfinity;
 
             foreach (var candidate in EnumerateDirections())
             {
                 var velocity = candidate * speed;
                 _trajectoryScratch.Clear();
+                float enemyOverlapSeconds;
+                float bulletOverlapSeconds;
+                float breakoutExitTime;
                 var score = EvaluateCandidate(
                     origin,
                     velocity,
                     playerRadius,
                     world.Walls,
                     world.Gems,
+                    encirclement,
+                    gemScale,
                     _trajectoryScratch,
-                    bestScore);
+                    bestScore,
+                    out enemyOverlapSeconds,
+                    out bulletOverlapSeconds,
+                    out breakoutExitTime);
                 var direction = velocity.sqrMagnitude > 0.0001f ? velocity.normalized : Vector2.zero;
                 score += ComputeKitingBonus(direction, directive);
+                var breakoutBonus = ComputeBreakoutBonus(direction, encirclement, breakoutExitTime);
+                score += breakoutBonus;
 
-                _debugInfo.RecordCandidate(direction, score);
+                _debugInfo.RecordCandidate(direction, score, enemyOverlapSeconds, bulletOverlapSeconds);
 
                 if (score > bestScore)
                 {
                     bestScore = score;
                     bestDirection = direction;
+                    bestBreakoutExitTime = breakoutExitTime;
+                    breakoutPreferred = breakoutBonus > 0f && encirclement.Intensity > 0f;
                     if (directive.HasDirective)
                     {
                         bestAlignment = ComputeTangentialAlignment(direction, directive);
                     }
-                    _debugInfo.RecordBest(bestDirection, bestScore, _trajectoryScratch);
+                    _debugInfo.RecordBest(
+                        bestDirection,
+                        bestScore,
+                        _trajectoryScratch,
+                        enemyOverlapSeconds,
+                        bulletOverlapSeconds,
+                        breakoutExitTime,
+                        breakoutPreferred,
+                        encirclement.Intensity);
                 }
             }
 
@@ -385,19 +459,26 @@ namespace AI_Mod.Runtime
                 return PlannerResult.Zero;
             }
 
-            if (!directive.HasDirective)
+            SteeringMode mode;
+            if (encirclement.Intensity >= 0.35f && breakoutPreferred)
             {
-                return new PlannerResult(bestDirection, SteeringMode.VelocityObstacle);
+                mode = SteeringMode.Breakout;
             }
-
-            if (!float.IsFinite(bestAlignment))
+            else if (!directive.HasDirective)
             {
-                bestAlignment = -1f;
+                mode = SteeringMode.VelocityObstacle;
             }
+            else
+            {
+                if (!float.IsFinite(bestAlignment))
+                {
+                    bestAlignment = -1f;
+                }
 
-            var mode = bestAlignment >= KitingAlignmentThreshold
-                ? SteeringMode.Kiting
-                : SteeringMode.Fallback;
+                mode = bestAlignment >= KitingAlignmentThreshold
+                    ? SteeringMode.Kiting
+                    : SteeringMode.Fallback;
+            }
 
             return new PlannerResult(bestDirection, mode);
         }
@@ -471,12 +552,20 @@ namespace AI_Mod.Runtime
             float playerRadius,
             IReadOnlyList<WallSegment> walls,
             IReadOnlyList<GemSnapshot> gems,
+            EncirclementSnapshot encirclement,
+            float gemScale,
             List<Vector2>? pathRecorder,
-            float bestScore)
+            float bestScore,
+            out float enemyOverlapSeconds,
+            out float bulletOverlapSeconds,
+            out float breakoutExitTime)
         {
             var position = origin;
             var score = 0f;
             var dt = SimulationStep;
+            enemyOverlapSeconds = 0f;
+            bulletOverlapSeconds = 0f;
+            breakoutExitTime = float.PositiveInfinity;
 
             pathRecorder?.Add(position);
 
@@ -487,22 +576,32 @@ namespace AI_Mod.Runtime
 
                 if (_enemyCount > 0)
                 {
-                    score -= EnemyPenaltyWeight * EvaluateDynamicObstacles(
+                    var overlap = EvaluateDynamicObstacles(
                         position,
                         _enemyProjectedPositions[step],
                         _enemyCombinedRadii,
                         _enemyCombinedRadiiSquared,
                         _enemyCount);
+                    if (overlap > 0f)
+                    {
+                        enemyOverlapSeconds += overlap * dt;
+                        score -= overlap * dt * OverlapPenaltyScale;
+                    }
                 }
 
                 if (_bulletCount > 0)
                 {
-                    score -= BulletPenaltyWeight * EvaluateDynamicObstacles(
+                    var overlap = EvaluateDynamicObstacles(
                         position,
                         _bulletProjectedPositions[step],
                         _bulletCombinedRadii,
                         _bulletCombinedRadiiSquared,
                         _bulletCount);
+                    if (overlap > 0f)
+                    {
+                        bulletOverlapSeconds += overlap * dt;
+                        score -= overlap * dt * OverlapPenaltyScale;
+                    }
                 }
 
                 var wallPenalty = EvaluateWallPenalty(position, walls, playerRadius);
@@ -516,7 +615,20 @@ namespace AI_Mod.Runtime
                 {
                     return float.NegativeInfinity;
                 }
-                score += GemRewardWeight * EvaluateGemReward(position, gems);
+                var gemReward = EvaluateGemReward(position, gems);
+                if (gemReward > 0f && gemScale > 0f)
+                {
+                    score += GemRewardWeight * gemReward * gemScale;
+                }
+
+                if (encirclement.HasRing && float.IsPositiveInfinity(breakoutExitTime))
+                {
+                    var radialDistance = (position - origin).magnitude;
+                    if (radialDistance >= encirclement.ExitRadius)
+                    {
+                        breakoutExitTime = (step + 1) * dt;
+                    }
+                }
 
                 var remainingSteps = SimulationSteps - step - 1;
                 if (remainingSteps <= 0)
@@ -532,6 +644,34 @@ namespace AI_Mod.Runtime
             }
 
             return score;
+        }
+        private float ComputeBreakoutBonus(Vector2 direction, EncirclementSnapshot encirclement, float breakoutExitTime)
+        {
+            if (!encirclement.HasRing || encirclement.Intensity <= 0f || direction.sqrMagnitude < 0.0001f || !encirclement.HasBreakoutDirection)
+            {
+                return 0f;
+            }
+
+            var alignment = Mathf.Max(0f, Vector2.Dot(direction, encirclement.BreakoutDirection));
+            if (alignment <= 0f)
+            {
+                return 0f;
+            }
+
+            var exitProgress = float.IsPositiveInfinity(breakoutExitTime)
+                ? 0f
+                : Mathf.Clamp01(1f - breakoutExitTime / SimulationDuration);
+
+            var gapEase = 1f - encirclement.GapOccupancy;
+            var weight = encirclement.Intensity * BreakoutRewardScale;
+            var blended = Mathf.Max(exitProgress, gapEase * 0.5f);
+            var bonus = weight * alignment * blended;
+            if (!float.IsFinite(bonus))
+            {
+                return 0f;
+            }
+
+            return bonus;
         }
 
         private static float EvaluateDynamicObstacles(
@@ -735,13 +875,18 @@ namespace AI_Mod.Runtime
             }
         }
 
-        private static float ComputeMaxGemRewardPerStep(IReadOnlyList<GemSnapshot> gems)
+        private static float ComputeMaxGemRewardPerStep(IReadOnlyList<GemSnapshot> gems, float gemScale)
         {
+            if (gemScale <= 0f)
+            {
+                return 0f;
+            }
+
             for (var i = 0; i < gems.Count; i++)
             {
                 if (gems[i].IsCollectible)
                 {
-                    return GemRewardWeight;
+                    return GemRewardWeight * gemScale;
                 }
             }
 
