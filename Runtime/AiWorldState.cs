@@ -29,6 +29,9 @@ namespace AI_Mod.Runtime
         private readonly List<WallSegment> _walls = new List<WallSegment>();
         private readonly FallbackLogger _fallbacks = new FallbackLogger();
         private readonly List<BulletPoolBinding> _bulletPools = new List<BulletPoolBinding>();
+        private readonly Dictionary<string, VelocityLookup> _velocityLookupCache = new Dictionary<string, VelocityLookup>(StringComparer.Ordinal);
+        private readonly Dictionary<string, BodyVelocityLookup> _bodyVelocityLookupCache = new Dictionary<string, BodyVelocityLookup>(StringComparer.Ordinal);
+        private static bool _enemyVelocityPropertyAvailable = true;
 
         private Stage? _stage;
         private bool _wallsCached;
@@ -895,14 +898,19 @@ namespace AI_Mod.Runtime
 
         private Vector2 ExtractVelocity(MonoBehaviour behaviour, string context)
         {
-            if (TryGetVectorProperty(behaviour, "Velocity", out var viaProperty))
+            if (behaviour == null || behaviour.Equals(null))
             {
-                return viaProperty;
+                return Vector2.zero;
             }
 
-            if (TryGetVectorField(behaviour, "_velocity", out var viaField))
+            if (TryExtractEnemyVelocity(behaviour, out var enemyVelocity))
             {
-                return viaField;
+                return enemyVelocity;
+            }
+
+            if (TryExtractCachedBehaviourVelocity(behaviour, out var cachedVelocity))
+            {
+                return cachedVelocity;
             }
 
             var go = behaviour.gameObject;
@@ -910,14 +918,9 @@ namespace AI_Mod.Runtime
             {
                 if (TryResolveBody(go, context, out var body) && body != null && !body.Equals(null))
                 {
-                    if (TryGetVectorProperty(body, "Velocity", out var viaBodyProperty))
+                    if (TryExtractCachedBodyVelocity(body, out var bodyVelocity))
                     {
-                        return viaBodyProperty;
-                    }
-
-                    if (TryGetVectorField(body, "_velocity", out var viaBodyField))
-                    {
-                        return viaBodyField;
+                        return bodyVelocity;
                     }
 
                     LogBodyVelocityDiagnostics(body, context);
@@ -926,6 +929,446 @@ namespace AI_Mod.Runtime
 
             _fallbacks.WarnOnce($"{context}VelocityFallback", $"Falling back to zero velocity for {context}; BaseBody velocity unavailable.");
             return Vector2.zero;
+        }
+
+        private bool TryExtractEnemyVelocity(MonoBehaviour behaviour, out Vector2 velocity)
+        {
+            velocity = default;
+
+            if (!_enemyVelocityPropertyAvailable)
+            {
+                return false;
+            }
+
+            var enemy = behaviour.TryCast<EnemyController>();
+            if (enemy == null || enemy.Equals(null))
+            {
+                return false;
+            }
+
+            try
+            {
+                var raw = (object)enemy.Velocity;
+                if (TryConvertVector(raw, out velocity))
+                {
+                    return true;
+                }
+
+                _enemyVelocityPropertyAvailable = false;
+                _fallbacks.WarnOnce("EnemyVelocityPropertyUnsupported", "EnemyController.Velocity returned unsupported type; using fallback path.");
+            }
+            catch (Exception ex)
+            {
+                _enemyVelocityPropertyAvailable = false;
+                _fallbacks.WarnOnce("EnemyVelocityAccessorDisabled", $"EnemyController.Velocity property unavailable: {ex.Message}. Falling back to cached reflection path.");
+            }
+
+            velocity = default;
+            return false;
+        }
+
+        private bool TryExtractCachedBehaviourVelocity(MonoBehaviour behaviour, out Vector2 velocity)
+        {
+            velocity = default;
+
+            var key = GetTypeCacheKey(behaviour);
+            if (string.IsNullOrEmpty(key))
+            {
+                return false;
+            }
+
+            if (!_velocityLookupCache.TryGetValue(key, out var lookup))
+            {
+                lookup = VelocityLookup.Create(behaviour);
+                _velocityLookupCache[key] = lookup;
+            }
+
+            if (lookup.HasGetters && lookup.TryGet(behaviour, out velocity))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool TryExtractCachedBodyVelocity(BaseBody body, out Vector2 velocity)
+        {
+            velocity = default;
+
+            var key = GetTypeCacheKey(body);
+            if (string.IsNullOrEmpty(key))
+            {
+                return false;
+            }
+
+            if (!_bodyVelocityLookupCache.TryGetValue(key, out var lookup))
+            {
+                lookup = BodyVelocityLookup.Create(body);
+                _bodyVelocityLookupCache[key] = lookup;
+            }
+
+            if (lookup.HasGetters && lookup.TryGet(body, out velocity))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static string GetTypeCacheKey(object instance)
+        {
+            if (instance == null)
+            {
+                return string.Empty;
+            }
+
+            if (instance is Il2CppSystem.Object il2Obj)
+            {
+                try
+                {
+                    var il2Type = il2Obj.GetIl2CppType();
+                    if (il2Type != null)
+                    {
+                        var fullName = il2Type.FullName;
+                        if (!string.IsNullOrEmpty(fullName))
+                        {
+                            return fullName;
+                        }
+
+                        var name = il2Type.Name;
+                        if (!string.IsNullOrEmpty(name))
+                        {
+                            return name;
+                        }
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            var managedType = instance.GetType();
+            if (managedType != null)
+            {
+                var fullName = managedType.FullName;
+                if (!string.IsNullOrEmpty(fullName))
+                {
+                    return fullName;
+                }
+
+                var name = managedType.Name;
+                if (!string.IsNullOrEmpty(name))
+                {
+                    return name;
+                }
+
+                return managedType.ToString();
+            }
+
+            return instance.GetHashCode().ToString(CultureInfo.InvariantCulture);
+        }
+
+        private delegate bool Il2CppVelocityGetter(Il2CppSystem.Object instance, out Vector2 value);
+        private delegate bool ManagedVelocityGetter(object instance, out Vector2 value);
+
+        private static Il2CppVelocityGetter? BuildIl2CppVelocityGetter(Il2CppSystem.Object sample)
+        {
+            if (sample == null || sample.Equals(null))
+            {
+                return null;
+            }
+
+            var type = sample.GetIl2CppType();
+            if (type == null)
+            {
+                return null;
+            }
+
+            if (TryLocateIl2CppVectorProperty(type, "Velocity", out var property))
+            {
+                return (Il2CppSystem.Object instance, out Vector2 value) =>
+                {
+                    try
+                    {
+                        var raw = property.GetValue(instance, null);
+                        return TryConvertVector(raw, out value);
+                    }
+                    catch
+                    {
+                        value = default;
+                        return false;
+                    }
+                };
+            }
+
+            if (TryLocateIl2CppVectorField(type, "_velocity", out var field))
+            {
+                return (Il2CppSystem.Object instance, out Vector2 value) =>
+                {
+                    try
+                    {
+                        var raw = field.GetValue(instance);
+                        return TryConvertVector(raw, out value);
+                    }
+                    catch
+                    {
+                        value = default;
+                        return false;
+                    }
+                };
+            }
+
+            return null;
+        }
+
+        private static ManagedVelocityGetter? BuildManagedVelocityGetter(object sample)
+        {
+            if (sample == null)
+            {
+                return null;
+            }
+
+            var managedType = sample.GetType();
+            if (managedType == null)
+            {
+                return null;
+            }
+
+            var flags = ClrBindingFlags.Instance | ClrBindingFlags.Public | ClrBindingFlags.NonPublic;
+
+            for (Type? cursor = managedType; cursor != null; cursor = cursor.BaseType)
+            {
+                PropertyInfo? property = null;
+                try
+                {
+                    property = cursor.GetProperty("Velocity", flags);
+                }
+                catch
+                {
+                    property = null;
+                }
+
+                if (property != null && property.GetIndexParameters().Length == 0)
+                {
+                    return (object instance, out Vector2 value) =>
+                    {
+                        try
+                        {
+                            var raw = property.GetValue(instance);
+                            return TryConvertVector(raw, out value);
+                        }
+                        catch
+                        {
+                            value = default;
+                            return false;
+                        }
+                    };
+                }
+            }
+
+            for (Type? cursor = managedType; cursor != null; cursor = cursor.BaseType)
+            {
+                FieldInfo? field = null;
+                try
+                {
+                    field = cursor.GetField("_velocity", flags);
+                }
+                catch
+                {
+                    field = null;
+                }
+
+                if (field != null)
+                {
+                    return (object instance, out Vector2 value) =>
+                    {
+                        try
+                        {
+                            var raw = field.GetValue(instance);
+                            return TryConvertVector(raw, out value);
+                        }
+                        catch
+                        {
+                            value = default;
+                            return false;
+                        }
+                    };
+                }
+            }
+
+            return null;
+        }
+
+        private sealed class VelocityLookup
+        {
+            private readonly Il2CppVelocityGetter? _il2CppGetter;
+            private readonly ManagedVelocityGetter? _managedGetter;
+
+            private VelocityLookup(Il2CppVelocityGetter? il2CppGetter, ManagedVelocityGetter? managedGetter)
+            {
+                _il2CppGetter = il2CppGetter;
+                _managedGetter = managedGetter;
+            }
+
+            internal bool HasGetters => _il2CppGetter != null || _managedGetter != null;
+
+            internal bool TryGet(MonoBehaviour behaviour, out Vector2 value)
+            {
+                value = default;
+
+                if (_il2CppGetter != null && behaviour is Il2CppSystem.Object il2Obj && !il2Obj.Equals(null))
+                {
+                    if (_il2CppGetter(il2Obj, out value))
+                    {
+                        return true;
+                    }
+                }
+
+                if (_managedGetter != null)
+                {
+                    if (_managedGetter(behaviour, out value))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            internal static VelocityLookup Create(MonoBehaviour sample)
+            {
+                Il2CppVelocityGetter? il2Getter = null;
+                ManagedVelocityGetter? managedGetter = null;
+
+                if (sample is Il2CppSystem.Object il2Obj && !il2Obj.Equals(null))
+                {
+                    il2Getter = BuildIl2CppVelocityGetter(il2Obj);
+                }
+
+                managedGetter = BuildManagedVelocityGetter(sample);
+
+                return new VelocityLookup(il2Getter, managedGetter);
+            }
+        }
+
+        private sealed class BodyVelocityLookup
+        {
+            private readonly Il2CppVelocityGetter? _il2CppGetter;
+            private readonly ManagedVelocityGetter? _managedGetter;
+
+            private BodyVelocityLookup(Il2CppVelocityGetter? il2CppGetter, ManagedVelocityGetter? managedGetter)
+            {
+                _il2CppGetter = il2CppGetter;
+                _managedGetter = managedGetter;
+            }
+
+            internal bool HasGetters => _il2CppGetter != null || _managedGetter != null;
+
+            internal bool TryGet(BaseBody body, out Vector2 value)
+            {
+                value = default;
+
+                if (_il2CppGetter != null && body is Il2CppSystem.Object il2Obj && !il2Obj.Equals(null))
+                {
+                    if (_il2CppGetter(il2Obj, out value))
+                    {
+                        return true;
+                    }
+                }
+
+                if (_managedGetter != null)
+                {
+                    if (_managedGetter(body, out value))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            internal static BodyVelocityLookup Create(BaseBody sample)
+            {
+                Il2CppVelocityGetter? il2Getter = null;
+                ManagedVelocityGetter? managedGetter = null;
+
+                if (sample is Il2CppSystem.Object il2Obj && !il2Obj.Equals(null))
+                {
+                    il2Getter = BuildIl2CppVelocityGetter(il2Obj);
+                }
+
+                managedGetter = BuildManagedVelocityGetter(sample);
+
+                return new BodyVelocityLookup(il2Getter, managedGetter);
+            }
+        }
+
+        private static bool TryLocateIl2CppVectorProperty(Il2CppSystem.Type type, string propertyName, out Il2CppSystem.Reflection.PropertyInfo? property)
+        {
+            property = null;
+            if (type == null)
+            {
+                return false;
+            }
+
+            var flags = Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic;
+            var cursor = type;
+            while (cursor != null)
+            {
+                Il2CppSystem.Reflection.PropertyInfo? candidate = null;
+                try
+                {
+                    candidate = cursor.GetProperty(propertyName, flags);
+                }
+                catch
+                {
+                    candidate = null;
+                }
+
+                if (candidate != null && (candidate.GetIndexParameters()?.Length ?? 0) == 0)
+                {
+                    property = candidate;
+                    return true;
+                }
+
+                cursor = cursor.BaseType;
+            }
+
+            return false;
+        }
+
+        private static bool TryLocateIl2CppVectorField(Il2CppSystem.Type type, string fieldName, out Il2CppSystem.Reflection.FieldInfo? field)
+        {
+            field = null;
+            if (type == null)
+            {
+                return false;
+            }
+
+            var flags = Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic;
+            var cursor = type;
+            while (cursor != null)
+            {
+                Il2CppSystem.Reflection.FieldInfo? candidate = null;
+                try
+                {
+                    candidate = cursor.GetField(fieldName, flags);
+                }
+                catch
+                {
+                    candidate = null;
+                }
+
+                if (candidate != null)
+                {
+                    field = candidate;
+                    return true;
+                }
+
+                cursor = cursor.BaseType;
+            }
+
+            return false;
         }
 
         private bool TryResolveBody(GameObject go, string context, out BaseBody? body)
