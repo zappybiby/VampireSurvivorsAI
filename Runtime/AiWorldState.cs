@@ -29,6 +29,11 @@ namespace AI_Mod.Runtime
         private readonly List<WallSegment> _walls = new List<WallSegment>();
         private readonly FallbackLogger _fallbacks = new FallbackLogger();
         private readonly List<BulletPoolBinding> _bulletPools = new List<BulletPoolBinding>();
+        private static readonly HashSet<string> ProjectilePoolNames = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "BULLET_1",
+            "BULLET_W"
+        };
         private readonly Dictionary<string, VelocityLookup> _velocityLookupCache = new Dictionary<string, VelocityLookup>(StringComparer.Ordinal);
         private readonly Dictionary<string, BodyVelocityLookup> _bodyVelocityLookupCache = new Dictionary<string, BodyVelocityLookup>(StringComparer.Ordinal);
         private static bool _enemyVelocityPropertyAvailable = true;
@@ -454,6 +459,12 @@ namespace AI_Mod.Runtime
                 if (string.IsNullOrEmpty(poolName))
                 {
                     _fallbacks.WarnOnce("BulletPoolUnnamed", "Encountered unnamed bullet pool; skipping.");
+                    continue;
+                }
+
+                if (!ProjectilePoolNames.Contains(poolName))
+                {
+                    _fallbacks.InfoOnce($"BulletPoolFiltered:{poolName}", $"Skipping non-projectile pool '{poolName}' when collecting bullets.");
                     continue;
                 }
 
