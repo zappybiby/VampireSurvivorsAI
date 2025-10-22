@@ -1,0 +1,1825 @@
+using Il2CppInterop.Runtime;
+using Il2CppInterop.Runtime.Attributes;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
+using Il2CppInterop.Runtime.InteropTypes.Fields;
+using Il2CppQFSW.MOP2;
+using MelonLoader;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Reflection;
+using UnityEngine;
+using UnityEngine.Tilemaps;
+using Il2Cpp;
+using CharacterController = Il2CppVampireSurvivors.Objects.Characters.CharacterController;
+using EnemyController = Il2CppVampireSurvivors.Objects.Characters.EnemyController;
+using Gem = Il2CppVampireSurvivors.Objects.Items.Gem;
+using Stage = Il2CppVampireSurvivors.Objects.Stage;
+using ClrBindingFlags = System.Reflection.BindingFlags;
+using Il2CppBindingFlags = Il2CppSystem.Reflection.BindingFlags;
+
+namespace AI_Mod.Runtime
+{
+    internal sealed class AiWorldState
+    {
+        private readonly List<DynamicObstacle> _enemies = new List<DynamicObstacle>();
+        private readonly List<DynamicObstacle> _bullets = new List<DynamicObstacle>();
+        private readonly List<GemSnapshot> _gems = new List<GemSnapshot>();
+        private readonly List<WallSegment> _walls = new List<WallSegment>();
+        private readonly FallbackLogger _fallbacks = new FallbackLogger();
+        private readonly List<BulletPoolBinding> _bulletPools = new List<BulletPoolBinding>();
+
+        private Stage? _stage;
+        private bool _wallsCached;
+        private bool _bulletPoolsInitialized;
+        private int _version = -1;
+
+        internal PlayerSnapshot Player { get; private set; } = PlayerSnapshot.Empty;
+        internal IReadOnlyList<DynamicObstacle> EnemyObstacles => _enemies;
+        internal IReadOnlyList<DynamicObstacle> BulletObstacles => _bullets;
+        internal IReadOnlyList<GemSnapshot> Gems => _gems;
+        internal IReadOnlyList<WallSegment> Walls => _walls;
+        [HideFromIl2Cpp]
+        internal int Version => _version;
+
+        internal void ClearTransient()
+        {
+            _enemies.Clear();
+            _bullets.Clear();
+            _gems.Clear();
+            _walls.Clear();
+            _wallsCached = false;
+            _stage = null;
+            _fallbacks.ResetTransient();
+            Player = PlayerSnapshot.Empty;
+            _version = -1;
+        }
+
+        internal void Refresh(CharacterController controller)
+        {
+            Player = BuildPlayerSnapshot(controller);
+            RefreshEnemies();
+            RefreshBullets();
+            RefreshGems();
+
+            if (!_wallsCached)
+            {
+                RefreshWalls();
+                _wallsCached = true;
+            }
+
+            if (_version == int.MaxValue)
+            {
+                _fallbacks.WarnOnce("WorldVersionWrap", "World snapshot version wrapped to zero; TODO: monitor long sessions.");
+                _version = 0;
+                return;
+            }
+
+            _version = _version < 0 ? 0 : _version + 1;
+        }
+
+        private PlayerSnapshot BuildPlayerSnapshot(CharacterController controller)
+        {
+            var position = TryGetVectorProperty(controller, nameof(controller.CurrentPos), out var pos)
+                ? pos
+                : ToVector2(controller.transform.position);
+
+            var velocity = ExtractVelocity(controller, "Player");
+
+            var moveSpeed = controller.PMoveSpeed();
+            var radius = EstimateRadius(controller.gameObject, "Player");
+
+            return new PlayerSnapshot(controller, position, velocity, radius, moveSpeed);
+        }
+
+        private Stage? EnsureStageReference()
+        {
+            if (_stage != null && !_stage.Equals(null))
+            {
+                var go = _stage.gameObject;
+                if (go != null && go.activeInHierarchy)
+                {
+                    return _stage;
+                }
+            }
+
+            _stage = null;
+
+            var stages = UnityEngine.Object.FindObjectsOfType<Stage>(true);
+            if (stages == null)
+            {
+                return null;
+            }
+
+            for (var i = 0; i < stages.Length; i++)
+            {
+                var candidate = stages[i];
+                if (candidate == null || candidate.Equals(null))
+                {
+                    continue;
+                }
+
+                var go = candidate.gameObject;
+                if (go == null || !go.activeInHierarchy)
+                {
+                    continue;
+                }
+
+                _stage = candidate;
+                break;
+            }
+
+            return _stage;
+        }
+
+        private void RefreshEnemies()
+        {
+            _enemies.Clear();
+
+            var stage = EnsureStageReference();
+            if (stage != null && !stage.Equals(null))
+            {
+                var roster = stage.SpawnedEnemies;
+                if (roster != null && !roster.Equals(null))
+                {
+                    var count = roster.Count;
+                    for (var i = 0; i < count; i++)
+                    {
+                        var enemy = roster[i];
+                        AppendEnemyObstacle(enemy);
+                    }
+
+                    return;
+                }
+
+                _fallbacks.WarnOnce("StageSpawnedEnemiesFallback", "Stage.SpawnedEnemies unavailable; using global enemy scan fallback.");
+            }
+            else
+            {
+                _fallbacks.WarnOnce("StageLookupFallback", "Stage component not found; using global enemy scan fallback.");
+            }
+
+            var enemies = UnityEngine.Object.FindObjectsOfType<EnemyController>(true);
+            foreach (var enemy in enemies)
+            {
+                AppendEnemyObstacle(enemy);
+            }
+        }
+
+        private void AppendEnemyObstacle(EnemyController? enemy)
+        {
+            if (enemy == null || enemy.Equals(null))
+            {
+                return;
+            }
+
+            var go = enemy.gameObject;
+            if (go == null || !go.activeInHierarchy)
+            {
+                return;
+            }
+
+            var position = enemy.transform.position;
+            var velocity = ExtractVelocity(enemy, "Enemy");
+            var radius = EstimateRadius(go, "Enemy");
+
+            _enemies.Add(new DynamicObstacle(position, velocity, radius, ObstacleKind.Enemy));
+        }
+
+        private void RefreshBullets()
+        {
+            _bullets.Clear();
+
+            var collectedFromPooler = TryCollectBulletsFromPooler();
+            if (!collectedFromPooler)
+            {
+                _fallbacks.WarnOnce("BulletPoolFallback", "Bullet pools unavailable; using scene scan fallback.");
+                CollectBulletsViaSceneScan();
+            }
+
+            if (_bullets.Count == 0)
+            {
+                _fallbacks.InfoOnce("BulletScanEmpty", "No active bullets detected; planner continues without projectile avoidance.");
+            }
+        }
+
+        private bool TryCollectBulletsFromPooler()
+        {
+            if (!EnsureBulletPoolBindings())
+            {
+                return false;
+            }
+
+            var success = true;
+            for (var i = 0; i < _bulletPools.Count; i++)
+            {
+                var binding = _bulletPools[i];
+                if (!binding.EnumerateInto(this))
+                {
+                    success = false;
+                }
+            }
+
+            if (!success)
+            {
+                _bulletPoolsInitialized = false;
+                _bulletPools.Clear();
+            }
+
+            return success;
+        }
+
+        private void CollectBulletsViaSceneScan()
+        {
+            foreach (var bulletType in BulletTypeCatalog.Types)
+            {
+                var raw = UnityEngine.Object.FindObjectsOfType(bulletType, true);
+                for (var i = 0; i < raw.Length; i++)
+                {
+                    var component = raw[i];
+                    if (component == null)
+                    {
+                        continue;
+                    }
+
+                    var behaviour = component.TryCast<MonoBehaviour>();
+                    if (behaviour == null || behaviour.gameObject == null || !behaviour.gameObject.activeInHierarchy)
+                    {
+                        continue;
+                    }
+
+                    AppendBulletFromBehaviour(behaviour);
+                }
+            }
+        }
+
+        private void AppendBulletFromBehaviour(MonoBehaviour behaviour)
+        {
+            if (behaviour == null || behaviour.Equals(null))
+            {
+                return;
+            }
+
+            var go = behaviour.gameObject;
+            if (go == null || go.Equals(null) || !go.activeInHierarchy)
+            {
+                return;
+            }
+
+            var position = behaviour.transform.position;
+            var velocity = ExtractVelocity(behaviour, "Bullet");
+            var radius = EstimateRadius(go, "Bullet");
+
+            _bullets.Add(new DynamicObstacle(position, velocity, radius, ObstacleKind.Bullet));
+        }
+
+        private bool EnsureBulletPoolBindings()
+        {
+            if (_bulletPoolsInitialized)
+            {
+                for (var i = _bulletPools.Count - 1; i >= 0; i--)
+                {
+                    if (!_bulletPools[i].IsAlive)
+                    {
+                        _bulletPools.RemoveAt(i);
+                    }
+                }
+
+                return _bulletPools.Count > 0;
+            }
+
+            _bulletPoolsInitialized = true;
+            _bulletPools.Clear();
+
+            MasterObjectPooler? pooler;
+            try
+            {
+                pooler = MasterObjectPooler.Instance;
+            }
+            catch (TypeInitializationException ex)
+            {
+                _fallbacks.WarnOnce("BulletPoolSingletonFailure", $"MasterObjectPooler.Instance threw TypeInitializationException: {ex.Message}. Using fallback.");
+                return false;
+            }
+
+            if (pooler == null || pooler.Equals(null))
+            {
+                return false;
+            }
+
+            var poolTable = pooler.PoolTable;
+            if (poolTable == null || poolTable.Equals(null))
+            {
+                _fallbacks.WarnOnce("BulletPoolTableMissing", "MasterObjectPooler.PoolTable unavailable; falling back to scene scan.");
+                return false;
+            }
+
+            foreach (var entry in poolTable)
+            {
+                var pool = entry.Value;
+                if (pool == null || pool.Equals(null))
+                {
+                    continue;
+                }
+
+                var poolName = ExtractPoolName(entry.Key);
+                if (string.IsNullOrEmpty(poolName))
+                {
+                    _fallbacks.WarnOnce("BulletPoolUnnamed", "Encountered unnamed bullet pool; skipping.");
+                    continue;
+                }
+
+                var binding = BulletPoolBinding.TryCreate(this, poolName!, pool);
+                if (binding != null)
+                {
+                    _bulletPools.Add(binding);
+                }
+            }
+
+            if (_bulletPools.Count == 0)
+            {
+                _fallbacks.WarnOnce("BulletPoolListEmpty", "No bullet pools discovered in MasterObjectPooler; using fallback.");
+                return false;
+            }
+
+            return true;
+        }
+
+        private static string? ExtractPoolName(object? rawKey)
+        {
+            if (rawKey == null)
+            {
+                return null;
+            }
+
+            switch (rawKey)
+            {
+                case string managed:
+                    return managed;
+                case Il2CppSystem.String il2cppString:
+                    return il2cppString.ToString();
+                default:
+                    return rawKey.ToString();
+            }
+        }
+
+        private bool TryEnumerateBulletPoolEntries(object aliveValue, BulletPoolBinding binding)
+        {
+            if (aliveValue is Il2CppSystem.Collections.Generic.Dictionary<int, GameObject> il2cppDict)
+            {
+                EnumerateIl2CppBulletDictionary(il2cppDict, binding);
+                return true;
+            }
+
+            if (aliveValue is Il2CppSystem.Object il2cppObject)
+            {
+                var typed = il2cppObject.TryCast<Il2CppSystem.Collections.Generic.Dictionary<int, GameObject>>();
+                if (typed != null && !typed.Equals(null))
+                {
+                    EnumerateIl2CppBulletDictionary(typed, binding);
+                    return true;
+                }
+
+                var genericDict = il2cppObject.TryCast<Il2CppSystem.Collections.Generic.Dictionary<int, Il2CppSystem.Object>>();
+                if (genericDict != null && !genericDict.Equals(null))
+                {
+                    var enumerator = genericDict.GetEnumerator();
+                    while (enumerator.MoveNext())
+                    {
+                        var entry = enumerator.Current;
+                        var raw = entry.Value;
+                        if (raw == null || raw.Equals(null))
+                        {
+                            continue;
+                        }
+
+                        var go = raw.TryCast<GameObject>();
+                        if (go != null && !go.Equals(null))
+                        {
+                            binding.AppendBulletFromPoolObject(this, go);
+                        }
+                    }
+                    enumerator.Dispose();
+                    return true;
+                }
+            }
+
+            if (aliveValue is Dictionary<int, GameObject> managedDict)
+            {
+                foreach (var entry in managedDict)
+                {
+                    binding.AppendBulletFromPoolObject(this, entry.Value);
+                }
+                return true;
+            }
+
+            if (aliveValue is IEnumerable<KeyValuePair<int, GameObject>> enumerable)
+            {
+                foreach (var entry in enumerable)
+                {
+                    binding.AppendBulletFromPoolObject(this, entry.Value);
+                }
+                return true;
+            }
+
+            if (aliveValue is IDictionary legacyDict)
+            {
+                foreach (DictionaryEntry entry in legacyDict)
+                {
+                    var value = entry.Value;
+                    if (value is GameObject go && go != null && !go.Equals(null))
+                    {
+                        binding.AppendBulletFromPoolObject(this, go);
+                        continue;
+                    }
+
+                    if (value is Il2CppSystem.Object il2Object)
+                    {
+                        var pooledGo = il2Object.TryCast<GameObject>();
+                        if (pooledGo != null && !pooledGo.Equals(null))
+                        {
+                            binding.AppendBulletFromPoolObject(this, pooledGo);
+                        }
+                    }
+                }
+                return true;
+            }
+
+            return false;
+        }
+
+        private void EnumerateIl2CppBulletDictionary(Il2CppSystem.Collections.Generic.Dictionary<int, GameObject> dictionary, BulletPoolBinding binding)
+        {
+            var enumerator = dictionary.GetEnumerator();
+            while (enumerator.MoveNext())
+            {
+                var entry = enumerator.Current;
+                binding.AppendBulletFromPoolObject(this, entry.Value);
+            }
+            enumerator.Dispose();
+        }
+
+        private sealed class BulletPoolBinding
+        {
+            private readonly string _poolName;
+            private readonly ObjectPool _pool;
+            private readonly Il2CppSystem.Reflection.FieldInfo _aliveField;
+            private Il2CppSystem.Type? _cachedBehaviourType;
+            private bool _behaviourFallbackLogged;
+
+            private BulletPoolBinding(string poolName, ObjectPool pool, Il2CppSystem.Reflection.FieldInfo aliveField)
+            {
+                _poolName = poolName;
+                _pool = pool;
+                _aliveField = aliveField;
+            }
+
+            internal static BulletPoolBinding? TryCreate(AiWorldState owner, string poolName, ObjectPool pool)
+            {
+                try
+                {
+                    var poolType = pool.GetIl2CppType();
+                    if (poolType == null)
+                    {
+                        owner._fallbacks.WarnOnce($"BulletPoolTypeMissing:{poolName}", $"Unable to resolve type metadata for bullet pool '{poolName}'; using fallback.");
+                        return null;
+                    }
+
+                    var aliveField = poolType.GetField(
+                        "_aliveObjects",
+                        Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic);
+                    if (aliveField == null)
+                    {
+                        owner._fallbacks.WarnOnce($"BulletPoolAliveMissing:{poolName}", $"Bullet pool '{poolName}' missing _aliveObjects field; using fallback.");
+                        return null;
+                    }
+
+                    return new BulletPoolBinding(poolName, pool, aliveField);
+                }
+                catch (Exception ex)
+                {
+                    owner._fallbacks.WarnOnce($"BulletPoolBindingException:{poolName}", $"Encountered exception while preparing bullet pool '{poolName}': {ex.Message}. Using fallback.");
+                    return null;
+                }
+            }
+
+            internal bool IsAlive => _pool != null && !_pool.Equals(null);
+
+            internal bool EnumerateInto(AiWorldState owner)
+            {
+                if (_pool == null || _pool.Equals(null))
+                {
+                    owner._fallbacks.WarnOnce($"BulletPoolInvalid:{_poolName}", $"Bullet pool '{_poolName}' no longer valid; forcing fallback.");
+                    return false;
+                }
+
+                object? aliveObjects;
+                try
+                {
+                    aliveObjects = _aliveField.GetValue(_pool);
+                }
+                catch (Exception ex)
+                {
+                    owner._fallbacks.WarnOnce($"BulletPoolAliveAccess:{_poolName}", $"Failed to access _aliveObjects for pool '{_poolName}': {ex.Message}. Using fallback.");
+                    return false;
+                }
+
+                if (aliveObjects == null)
+                {
+                    return true;
+                }
+
+                if (owner.TryEnumerateBulletPoolEntries(aliveObjects, this))
+                {
+                    return true;
+                }
+
+                owner._fallbacks.WarnOnce($"BulletPoolAliveUnexpected:{_poolName}", $"Bullet pool '{_poolName}' returned unsupported _aliveObjects type; using fallback.");
+                return false;
+            }
+
+            internal void AppendBulletFromPoolObject(AiWorldState owner, GameObject? go)
+            {
+                if (go == null || go.Equals(null))
+                {
+                    return;
+                }
+
+                var transform = go.transform;
+                if (transform == null || transform.Equals(null))
+                {
+                    owner._fallbacks.WarnOnce($"BulletPoolTransformMissing:{_poolName}", $"Bullet pool '{_poolName}' entry missing transform; skipping.");
+                    return;
+                }
+
+                var worldPosition = transform.position;
+                var velocity = ResolveVelocity(owner, go);
+                var radius = owner.EstimateRadius(go, "Bullet");
+
+                owner._bullets.Add(new DynamicObstacle(
+                    AiWorldState.ToVector2(worldPosition),
+                    velocity,
+                    radius,
+                    ObstacleKind.Bullet));
+            }
+
+            private Vector2 ResolveVelocity(AiWorldState owner, GameObject go)
+            {
+                if (TryResolveBehaviour(owner, go, out var behaviour) && behaviour != null)
+                {
+                    return owner.ExtractVelocity(behaviour, $"Bullet[{_poolName}]");
+                }
+
+                if (!_behaviourFallbackLogged)
+                {
+                    owner._fallbacks.WarnOnce($"BulletPoolBehaviourMissing:{_poolName}", $"Bullet pool '{_poolName}' entries missing behaviour component; using zero velocity fallback.");
+                    _behaviourFallbackLogged = true;
+                }
+
+                return Vector2.zero;
+            }
+
+            private bool TryResolveBehaviour(AiWorldState owner, GameObject go, out MonoBehaviour? behaviour)
+            {
+                behaviour = null;
+
+                if (TryResolveCachedType(go, owner, out var component))
+                {
+                    behaviour = component?.TryCast<MonoBehaviour>();
+                    if (behaviour != null && !behaviour.Equals(null))
+                    {
+                        return true;
+                    }
+                }
+
+                var behaviours = go.GetComponents<MonoBehaviour>();
+                if (behaviours == null)
+                {
+                    return false;
+                }
+
+                for (var i = 0; i < behaviours.Length; i++)
+                {
+                    var candidate = behaviours[i];
+                    if (candidate == null || candidate.Equals(null))
+                    {
+                        continue;
+                    }
+
+                    behaviour = candidate;
+                    CacheBehaviourType(candidate);
+                    return true;
+                }
+
+                return false;
+            }
+
+            private bool TryResolveCachedType(GameObject go, AiWorldState owner, out Component? component)
+            {
+                component = null;
+
+                if (_cachedBehaviourType == null)
+                {
+                    return false;
+                }
+
+                try
+                {
+                    component = go.GetComponent(_cachedBehaviourType);
+                    if (component == null || component.Equals(null))
+                    {
+                        component = null;
+                        return false;
+                    }
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    owner._fallbacks.WarnOnce($"BulletPoolCachedTypeError:{_poolName}", $"Failed to use cached behaviour type for pool '{_poolName}': {ex.Message}. Clearing cache.");
+                    _cachedBehaviourType = null;
+                    component = null;
+                    return false;
+                }
+            }
+
+            private void CacheBehaviourType(Component behaviour)
+            {
+                if (behaviour == null || behaviour.Equals(null))
+                {
+                    return;
+                }
+
+                var il2Type = behaviour.GetIl2CppType();
+                if (il2Type == null)
+                {
+                    return;
+                }
+
+                _cachedBehaviourType = il2Type;
+            }
+        }
+
+        private void RefreshGems()
+        {
+            _gems.Clear();
+
+            if (!TryCollectGemsFromPooler())
+            {
+                CollectGemsViaSceneScan();
+            }
+        }
+
+        private bool TryCollectGemsFromPooler()
+        {
+            MasterObjectPooler? pooler;
+            try
+            {
+                pooler = MasterObjectPooler.Instance;
+            }
+            catch (TypeInitializationException ex)
+            {
+                _fallbacks.WarnOnce("GemPoolSingletonFailure", $"MasterObjectPooler.Instance threw TypeInitializationException: {ex.Message}. Using fallback.");
+                return false;
+            }
+
+            if (pooler == null || pooler.Equals(null))
+            {
+                return false;
+            }
+
+            var poolTable = pooler.PoolTable;
+            if (poolTable == null || poolTable.Equals(null))
+            {
+                _fallbacks.WarnOnce("GemPoolTableMissing", "MasterObjectPooler.PoolTable unavailable; falling back to scene scan.");
+                return false;
+            }
+
+            ObjectPool? gemsPool = null;
+            foreach (var entry in poolTable)
+            {
+                var key = entry.Key;
+                var managedKey = key == null ? null : (string?)key;
+                if (!string.Equals(managedKey, "Gems", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                gemsPool = entry.Value;
+                break;
+            }
+
+            if (gemsPool == null || gemsPool.Equals(null))
+            {
+                return false;
+            }
+
+            var poolType = gemsPool.GetIl2CppType();
+            if (poolType == null)
+            {
+                _fallbacks.WarnOnce("GemPoolTypeLookupFailed", "Unable to resolve gem pool type metadata; using fallback.");
+                return false;
+            }
+
+            var aliveField = poolType.GetField(
+                "_aliveObjects",
+                Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic);
+            if (aliveField == null)
+            {
+                _fallbacks.WarnOnce("GemPoolAliveFieldMissing", "Gem pool missing _aliveObjects field; using fallback.");
+                return false;
+            }
+
+            object? aliveValue;
+            try
+            {
+                aliveValue = aliveField.GetValue(gemsPool);
+            }
+            catch (Exception ex)
+            {
+                _fallbacks.WarnOnce("GemPoolAliveAccessError", $"Exception while accessing gem pool _aliveObjects: {ex.Message}. Using scene scan fallback.");
+                return false;
+            }
+
+            if (aliveValue == null)
+            {
+                return true;
+            }
+
+            if (TryEnumerateGemPoolEntries(aliveValue))
+            {
+                return true;
+            }
+
+            var aliveIl2Type = (aliveValue as Il2CppSystem.Object)?.GetIl2CppType();
+            var typeName = aliveIl2Type != null ? (string?)aliveIl2Type.FullName : "unknown";
+            _fallbacks.WarnOnce("GemPoolAliveDictionaryUnexpected", $"Gem pool _aliveObjects had unexpected type '{typeName ?? "unknown"}'; using scene scan fallback.");
+            return false;
+        }
+
+        private void CollectGemsViaSceneScan()
+        {
+            var gems = UnityEngine.Object.FindObjectsOfType<Gem>(true);
+            foreach (var gem in gems)
+            {
+                AppendGemFromComponent(gem);
+            }
+        }
+
+        private void AppendGemFromComponent(Gem? gem)
+        {
+            if (gem == null || gem.Equals(null))
+            {
+                return;
+            }
+
+            var go = gem.gameObject;
+            if (go == null || go.Equals(null))
+            {
+                return;
+            }
+
+            var transform = gem.transform;
+            if (transform == null || transform.Equals(null))
+            {
+                _fallbacks.WarnOnce("GemSceneTransformMissing", "Gem component missing transform; skipping entry.");
+                return;
+            }
+
+            AppendGemSnapshot(go, transform.position, go.activeInHierarchy);
+        }
+
+        private void AppendGemFromPoolObject(GameObject? go)
+        {
+            if (go == null || go.Equals(null))
+            {
+                return;
+            }
+
+            var component = go.GetComponent(Il2CppType.Of<Gem>());
+            var gem = component?.TryCast<Gem>();
+            Transform? transform;
+            if (gem != null && !gem.Equals(null))
+            {
+                transform = gem.transform;
+            }
+            else
+            {
+                _fallbacks.WarnOnce("GemPoolComponentMissing", "Gem pool entry missing Gem component; using GameObject transform fallback.");
+                transform = go.transform;
+            }
+
+            if (transform == null || transform.Equals(null))
+            {
+                _fallbacks.WarnOnce("GemPoolTransformMissing", "Gem pool entry missing transform; skipping entry.");
+                return;
+            }
+
+            AppendGemSnapshot(go, transform.position, go.activeInHierarchy);
+        }
+
+        private void AppendGemSnapshot(GameObject go, Vector3 worldPosition, bool collectible)
+        {
+            var position = ToVector2(worldPosition);
+            var radius = EstimateRadius(go, "Gem");
+            _gems.Add(new GemSnapshot(position, radius, collectible));
+        }
+
+        private bool TryEnumerateGemPoolEntries(object aliveValue)
+        {
+            if (aliveValue is Il2CppSystem.Collections.Generic.Dictionary<int, GameObject> il2cppDict)
+            {
+                EnumerateIl2CppDictionary(il2cppDict);
+                return true;
+            }
+
+            if (aliveValue is Il2CppSystem.Object il2cppObject)
+            {
+                var typed = il2cppObject.TryCast<Il2CppSystem.Collections.Generic.Dictionary<int, GameObject>>();
+                if (typed != null && !typed.Equals(null))
+                {
+                    EnumerateIl2CppDictionary(typed);
+                    return true;
+                }
+
+                var genericDict = il2cppObject.TryCast<Il2CppSystem.Collections.Generic.Dictionary<int, Il2CppSystem.Object>>();
+                if (genericDict != null && !genericDict.Equals(null))
+                {
+                    var enumerator = genericDict.GetEnumerator();
+                    while (enumerator.MoveNext())
+                    {
+                        var entry = enumerator.Current;
+                        var rawValue = entry.Value;
+                        if (rawValue == null || rawValue.Equals(null))
+                        {
+                            continue;
+                        }
+
+                        var gameObject = rawValue.TryCast<GameObject>();
+                        if (gameObject != null && !gameObject.Equals(null))
+                        {
+                            AppendGemFromPoolObject(gameObject);
+                        }
+                    }
+                    enumerator.Dispose();
+                    return true;
+                }
+            }
+
+            if (aliveValue is Dictionary<int, GameObject> managedDict)
+            {
+                foreach (var entry in managedDict)
+                {
+                    AppendGemFromPoolObject(entry.Value);
+                }
+                return true;
+            }
+
+            if (aliveValue is IEnumerable<KeyValuePair<int, GameObject>> enumerable)
+            {
+                foreach (var entry in enumerable)
+                {
+                    AppendGemFromPoolObject(entry.Value);
+                }
+                return true;
+            }
+
+            if (aliveValue is IDictionary legacyDict)
+            {
+                foreach (DictionaryEntry entry in legacyDict)
+                {
+                    var value = entry.Value;
+                    if (value is GameObject go && go != null && !go.Equals(null))
+                    {
+                        AppendGemFromPoolObject(go);
+                        continue;
+                    }
+
+                    if (value is Il2CppSystem.Object il2Object)
+                    {
+                        var pooledGo = il2Object.TryCast<GameObject>();
+                        if (pooledGo != null && !pooledGo.Equals(null))
+                        {
+                            AppendGemFromPoolObject(pooledGo);
+                        }
+                    }
+                }
+                return true;
+            }
+
+            return false;
+        }
+
+        private void EnumerateIl2CppDictionary(Il2CppSystem.Collections.Generic.Dictionary<int, GameObject> dictionary)
+        {
+            var enumerator = dictionary.GetEnumerator();
+            while (enumerator.MoveNext())
+            {
+                var entry = enumerator.Current;
+                AppendGemFromPoolObject(entry.Value);
+            }
+            enumerator.Dispose();
+        }
+
+        private void RefreshWalls()
+        {
+            _walls.Clear();
+            var tilemaps = UnityEngine.Object.FindObjectsOfType<Tilemap>(true);
+            foreach (var tilemap in tilemaps)
+            {
+                if (tilemap == null || tilemap.gameObject == null)
+                {
+                    continue;
+                }
+
+                var name = tilemap.gameObject.name ?? string.Empty;
+                if (!name.Contains("Walls", StringComparison.OrdinalIgnoreCase) &&
+                    !name.Contains("PlayerWall", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                AppendTilemapWalls(tilemap);
+            }
+        }
+
+        private void AppendTilemapWalls(Tilemap tilemap)
+        {
+            if (tilemap == null)
+            {
+                return;
+            }
+
+            var grid = tilemap.layoutGrid;
+            var cellSize = grid != null ? grid.cellSize : Vector3.one;
+
+            var bounds = tilemap.cellBounds;
+            var min = bounds.min;
+            var maxExclusive = bounds.max;
+
+            for (var x = min.x; x < maxExclusive.x; x++)
+            {
+                for (var y = min.y; y < maxExclusive.y; y++)
+                {
+                    for (var z = min.z; z < maxExclusive.z; z++)
+                    {
+                        var cell = new Vector3Int(x, y, z);
+                        if (!tilemap.HasTile(cell))
+                        {
+                            continue;
+                        }
+
+                        var worldCenter = tilemap.GetCellCenterWorld(cell);
+                        var rect = new Rect(
+                            worldCenter.x - cellSize.x * 0.5f,
+                            worldCenter.y - cellSize.y * 0.5f,
+                            cellSize.x,
+                            cellSize.y);
+                        _walls.Add(new WallSegment(rect));
+                    }
+                }
+            }
+        }
+
+        private Vector2 ExtractVelocity(MonoBehaviour behaviour, string context)
+        {
+            if (TryGetVectorProperty(behaviour, "Velocity", out var viaProperty))
+            {
+                return viaProperty;
+            }
+
+            if (TryGetVectorField(behaviour, "_velocity", out var viaField))
+            {
+                return viaField;
+            }
+
+            var go = behaviour.gameObject;
+            if (go != null && !go.Equals(null))
+            {
+                if (TryResolveBody(go, context, out var body) && body != null && !body.Equals(null))
+                {
+                    if (TryGetVectorProperty(body, "Velocity", out var viaBodyProperty))
+                    {
+                        return viaBodyProperty;
+                    }
+
+                    if (TryGetVectorField(body, "_velocity", out var viaBodyField))
+                    {
+                        return viaBodyField;
+                    }
+
+                    LogBodyVelocityDiagnostics(body, context);
+                }
+            }
+
+            _fallbacks.WarnOnce($"{context}VelocityFallback", $"Falling back to zero velocity for {context}; BaseBody velocity unavailable.");
+            return Vector2.zero;
+        }
+
+        private bool TryResolveBody(GameObject go, string context, out BaseBody? body)
+        {
+            body = null;
+
+            var component = go.GetComponent(Il2CppType.Of<PhaserGameObject>());
+            var phaser = component?.TryCast<PhaserGameObject>();
+            if (phaser == null || phaser.Equals(null))
+            {
+                _fallbacks.InfoOnce($"{context}BodyMissing", $"PhaserGameObject not found for {context}; using renderer bounds.");
+                return false;
+            }
+
+            var direct = phaser.body;
+            if (direct != null && !direct.Equals(null))
+            {
+                body = direct;
+                return true;
+            }
+
+            _fallbacks.WarnOnce($"{context}BodyUnavailable", $"Phaser body unavailable for {context}; using renderer bounds.");
+            return false;
+        }
+
+        private bool TryExtractBodyRadius(BaseBody body, out float radius)
+        {
+            radius = 0f;
+
+            if (body == null || body.Equals(null))
+            {
+                return false;
+            }
+
+            var worldRadius = body.WorldRadius;
+            if (worldRadius > 0f)
+            {
+                radius = worldRadius;
+                return true;
+            }
+
+            var phaserRadius = body.PhaserRadius;
+            if (phaserRadius > 0f)
+            {
+                radius = phaserRadius;
+                return true;
+            }
+
+            var width = Math.Abs(body.right - body.left);
+            var height = Math.Abs(body.top - body.bottom);
+            var candidate = 0.5f * Mathf.Max(width, height);
+            if (candidate > 0f)
+            {
+                radius = candidate;
+                return true;
+            }
+
+            var rawRadius = body._radius;
+            if (rawRadius > 0f)
+            {
+                radius = rawRadius;
+                return true;
+            }
+
+            return false;
+        }
+
+        private float EstimateRadius(GameObject? go, string context)
+        {
+            if (go == null)
+            {
+                _fallbacks.WarnOnce($"{context}RadiusNullGO", $"GameObject missing for {context}; defaulting radius to 0.5.");
+                return 0.5f;
+            }
+
+            if (TryResolveBody(go, context, out var body))
+            {
+                if (body != null && TryExtractBodyRadius(body, out var radiusFromBody))
+                {
+                    return radiusFromBody;
+                }
+
+                _fallbacks.WarnOnce($"{context}BodyRadiusFallback", $"Phaser body radius unavailable for {context}; using renderer bounds.");
+            }
+
+            var renderer = go.GetComponent<SpriteRenderer>() ?? go.GetComponentInChildren<SpriteRenderer>(true);
+            if (renderer != null)
+            {
+                var extents = renderer.bounds.extents;
+                var candidate = Mathf.Max(extents.x, extents.y);
+                if (candidate > 0f)
+                {
+                    return candidate;
+                }
+            }
+
+            _fallbacks.WarnOnce($"{context}RadiusFallback", $"Unable to derive radius for {context}; defaulting radius to 0.5.");
+            return 0.5f;
+        }
+
+        private static bool TryGetVectorProperty(object source, string propertyName, out Vector2 value)
+        {
+            value = default;
+            if (source == null) return false;
+
+            if (source is UnityEngine.Object uobj)
+            {
+                var il2Type = uobj.GetIl2CppType();
+                if (TryGetVectorPropertyFromIl2Cpp(uobj, il2Type, propertyName, out value))
+                {
+                    return true;
+                }
+            }
+            else if (source is Il2CppSystem.Object il2Obj)
+            {
+                if (TryGetVectorPropertyFromIl2Cpp(il2Obj, il2Obj.GetIl2CppType(), propertyName, out value))
+                {
+                    return true;
+                }
+            }
+
+            var flagsClr = ClrBindingFlags.Instance | ClrBindingFlags.Public | ClrBindingFlags.NonPublic;
+            var mt = source.GetType();
+            while (mt != null)
+            {
+                var mprop = mt.GetProperty(propertyName, flagsClr);
+                if (mprop != null && mprop.GetIndexParameters().Length == 0)
+                {
+                    try { return TryConvertVector(mprop.GetValue(source), out value); }
+                    catch { return false; }
+                }
+
+                mt = mt.BaseType;
+            }
+            return false;
+        }
+
+        private static bool TryGetVectorField(object source, string fieldName, out Vector2 value)
+        {
+            value = default;
+            if (source == null) return false;
+
+            if (source is UnityEngine.Object uobj)
+            {
+                if (TryGetVectorFieldFromIl2Cpp(uobj, uobj.GetIl2CppType(), fieldName, out value))
+                {
+                    return true;
+                }
+            }
+            else if (source is Il2CppSystem.Object il2Obj)
+            {
+                if (TryGetVectorFieldFromIl2Cpp(il2Obj, il2Obj.GetIl2CppType(), fieldName, out value))
+                {
+                    return true;
+                }
+            }
+
+            var flagsClr = ClrBindingFlags.Instance | ClrBindingFlags.Public | ClrBindingFlags.NonPublic;
+            var mt = source.GetType();
+            while (mt != null)
+            {
+                var mfield = mt.GetField(fieldName, flagsClr);
+                if (mfield != null)
+                {
+                    try { return TryConvertVector(mfield.GetValue(source), out value); }
+                    catch { return false; }
+                }
+
+                mt = mt.BaseType;
+            }
+            return false;
+        }
+
+        private static bool TryGetVectorPropertyFromIl2Cpp(object instance, Il2CppSystem.Type? type, string propertyName, out Vector2 value)
+        {
+            value = default;
+            var il2Instance = instance as Il2CppSystem.Object;
+            if (il2Instance == null || type == null)
+            {
+                return false;
+            }
+
+            var flags = Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic;
+            while (type != null)
+            {
+                Il2CppSystem.Reflection.PropertyInfo? prop = null;
+                try
+                {
+                    prop = type.GetProperty(propertyName, flags);
+                }
+                catch
+                {
+                    prop = null;
+                }
+
+                if (prop != null && (prop.GetIndexParameters()?.Length ?? 0) == 0)
+                {
+                    try
+                    {
+                        return TryConvertVector(prop.GetValue(il2Instance, null), out value);
+                    }
+                    catch
+                    {
+                        value = default;
+                        return false;
+                    }
+                }
+
+                type = type.BaseType;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetVectorFieldFromIl2Cpp(object instance, Il2CppSystem.Type? type, string fieldName, out Vector2 value)
+        {
+            value = default;
+            var il2Instance = instance as Il2CppSystem.Object;
+            if (il2Instance == null || type == null)
+            {
+                return false;
+            }
+
+            var flags = Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic;
+            while (type != null)
+            {
+                Il2CppSystem.Reflection.FieldInfo? field = null;
+                try
+                {
+                    field = type.GetField(fieldName, flags);
+                }
+                catch
+                {
+                    field = null;
+                }
+
+                if (field != null)
+                {
+                    try
+                    {
+                        return TryConvertVector(field.GetValue(il2Instance), out value);
+                    }
+                    catch
+                    {
+                        value = default;
+                        return false;
+                    }
+                }
+
+                type = type.BaseType;
+            }
+
+            return false;
+        }
+
+        private static bool TryConvertVector(object? raw, out Vector2 value)
+        {
+            value = default;
+            if (raw == null)
+            {
+                return false;
+            }
+
+            switch (raw)
+            {
+                case Vector2 vec2:
+                    value = vec2;
+                    return true;
+                case Il2CppValueField<Vector2> vec2Field:
+                    value = vec2Field.Value;
+                    return true;
+                case Vector3 vec3:
+                    value = new Vector2(vec3.x, vec3.y);
+                    return true;
+                case Il2CppValueField<Vector3> vec3Field:
+                    var v3 = vec3Field.Value;
+                    value = new Vector2(v3.x, v3.y);
+                    return true;
+                case Unity.Mathematics.float2 float2:
+                    value = new Vector2(float2.x, float2.y);
+                    return true;
+                case Il2CppValueField<Unity.Mathematics.float2> float2Field:
+                    var v2 = float2Field.Value;
+                    value = new Vector2(v2.x, v2.y);
+                    return true;
+            }
+
+            if (raw is Il2CppSystem.Object il2Object && TryConvertIl2CppStructVector(il2Object, out value))
+            {
+                return true;
+            }
+
+            if (raw is Il2CppStructArray<Vector2> vectorArray && vectorArray.Length > 0)
+            {
+                value = vectorArray[0];
+                return true;
+            }
+
+            if (raw is Il2CppStructArray<Vector3> vector3Array && vector3Array.Length > 0)
+            {
+                var item = vector3Array[0];
+                value = new Vector2(item.x, item.y);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryConvertIl2CppStructVector(Il2CppSystem.Object il2Object, out Vector2 value)
+        {
+            value = default;
+            if (il2Object == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var type = il2Object.GetIl2CppType();
+                if (type == null)
+                {
+                    return false;
+                }
+
+                var fullName = type.FullName ?? string.Empty;
+                if (!IsKnownVectorStruct(fullName))
+                {
+                    return false;
+                }
+
+                if (TryReadIl2CppVectorComponent(il2Object, type, "x", out var x) &&
+                    TryReadIl2CppVectorComponent(il2Object, type, "y", out var y))
+                {
+                    value = new Vector2(x, y);
+                    return true;
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
+        private static bool IsKnownVectorStruct(string typeName)
+        {
+            return typeName == "Unity.Mathematics.float2" ||
+                   typeName == "UnityEngine.Vector2" ||
+                   typeName == "UnityEngine.Vector3";
+        }
+
+        private static bool TryReadIl2CppVectorComponent(Il2CppSystem.Object source, Il2CppSystem.Type type, string componentName, out float component)
+        {
+            component = 0f;
+            if (source == null || type == null)
+            {
+                return false;
+            }
+
+            var flags = Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic;
+
+            try
+            {
+                var property = type.GetProperty(componentName, flags);
+                if (property != null)
+                {
+                    var raw = property.GetValue(source, null);
+                    if (TryConvertFloat(raw, out component))
+                    {
+                        return true;
+                    }
+                }
+
+                var field = type.GetField(componentName, flags);
+                if (field != null)
+                {
+                    var raw = field.GetValue(source);
+                    if (TryConvertFloat(raw, out component))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
+        private void LogBodyVelocityDiagnostics(BaseBody body, string context)
+        {
+            try
+            {
+                var type = body.GetIl2CppType();
+                var typeName = type != null ? type.FullName : "unknown";
+                var propertyType = "unknown";
+                var propertyValueType = "unknown";
+                var propertyVector = "n/a";
+                var fieldType = "unknown";
+                var fieldValueType = "unknown";
+                var fieldVector = "n/a";
+                Type? managedType = null;
+
+                if (type != null && TryDescribeIl2CppProperty(body, type, "Velocity", out var il2PropType, out var il2PropValueType, out var il2PropVector))
+                {
+                    propertyType = il2PropType;
+                    propertyValueType = il2PropValueType;
+                    propertyVector = il2PropVector;
+                }
+                else
+                {
+                    managedType = body.GetType();
+                    if (managedType != null)
+                    {
+                        var flags = ClrBindingFlags.Instance | ClrBindingFlags.Public | ClrBindingFlags.NonPublic;
+                        var mt = managedType;
+                        while (mt != null)
+                        {
+                            var propertyInfo = mt.GetProperty("Velocity", flags);
+                            if (propertyInfo != null)
+                            {
+                                propertyType = propertyInfo.PropertyType.FullName ?? "unknown";
+                                try
+                                {
+                                    var value = propertyInfo.GetValue(body);
+                                    propertyValueType = DescribeObject(value);
+                                    if (TryConvertVector(value, out var converted))
+                                    {
+                                        propertyVector = $"{converted.x:F4},{converted.y:F4}";
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    propertyValueType = $"error:{ex.Message}";
+                                }
+
+                                break;
+                            }
+
+                            mt = mt.BaseType;
+                        }
+                    }
+                }
+
+                if (body is Il2CppSystem.Object bodyIl2Field && TryDescribeIl2CppField(bodyIl2Field, bodyIl2Field.GetIl2CppType(), "_velocity", out var il2FieldType, out var il2FieldValueType, out var il2FieldVector))
+                {
+                    fieldType = il2FieldType;
+                    fieldValueType = il2FieldValueType;
+                    fieldVector = il2FieldVector;
+                }
+                else if (managedType != null)
+                {
+                    var flags = ClrBindingFlags.Instance | ClrBindingFlags.Public | ClrBindingFlags.NonPublic;
+                    var mt = managedType;
+                    while (mt != null)
+                    {
+                        var fieldInfo = mt.GetField("_velocity", flags);
+                        if (fieldInfo != null)
+                        {
+                            fieldType = fieldInfo.FieldType.FullName ?? "unknown";
+                            try
+                            {
+                                var value = fieldInfo.GetValue(body);
+                                fieldValueType = DescribeObject(value);
+                                if (TryConvertVector(value, out var converted))
+                                {
+                                    fieldVector = $"{converted.x:F4},{converted.y:F4}";
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                fieldValueType = $"error:{ex.Message}";
+                            }
+
+                            break;
+                        }
+
+                        mt = mt.BaseType;
+                    }
+                }
+
+                _fallbacks.InfoOnce(
+                    $"{context}VelocityDiagnostics",
+                    $"Velocity diagnostics for {context}: BodyType={typeName}; VelocityPropertyType={propertyType}; VelocityPropertyValueType={propertyValueType}; VelocityPropertyVector={propertyVector}; _velocityFieldType={fieldType}; _velocityFieldValueType={fieldValueType}; _velocityFieldVector={fieldVector}");
+            }
+            catch (Exception ex)
+            {
+                _fallbacks.WarnOnce($"{context}VelocityDiagnosticsError", $"Velocity diagnostics failed: {ex.Message}");
+            }
+        }
+
+        private static string DescribeObject(object? value)
+        {
+            if (value == null)
+            {
+                return "null";
+            }
+
+            try
+            {
+                if (value is Il2CppSystem.Object il2Obj)
+                {
+                    var type = il2Obj.GetIl2CppType();
+                    if (type != null && !string.IsNullOrEmpty(type.FullName))
+                    {
+                        return type.FullName;
+                    }
+                }
+
+                return value.GetType().FullName ?? value.ToString() ?? "unknown";
+            }
+            catch
+            {
+                return "unknown";
+            }
+        }
+
+        private static bool TryDescribeIl2CppProperty(Il2CppSystem.Object instance, Il2CppSystem.Type? type, string propertyName, out string propertyType, out string valueType, out string vectorValue)
+        {
+            propertyType = "unknown";
+            valueType = "unknown";
+            vectorValue = "n/a";
+
+            if (instance == null || type == null)
+            {
+                return false;
+            }
+
+            var flags = Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic;
+
+            while (type != null)
+            {
+                Il2CppSystem.Reflection.PropertyInfo? property = null;
+                try
+                {
+                    property = type.GetProperty(propertyName, flags);
+                }
+                catch
+                {
+                    property = null;
+                }
+
+                if (property != null)
+                {
+                    propertyType = property.PropertyType?.FullName ?? "unknown";
+
+                    try
+                    {
+                        var value = property.GetValue(instance, null);
+                        valueType = DescribeObject(value);
+                        if (TryConvertVector(value, out var converted))
+                        {
+                            vectorValue = $"{converted.x:F4},{converted.y:F4}";
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        valueType = $"error:{ex.Message}";
+                    }
+
+                    return true;
+                }
+
+                type = type.BaseType;
+            }
+
+            return false;
+        }
+
+        private static bool TryDescribeIl2CppField(Il2CppSystem.Object instance, Il2CppSystem.Type? type, string fieldName, out string fieldType, out string valueType, out string vectorValue)
+        {
+            fieldType = "unknown";
+            valueType = "unknown";
+            vectorValue = "n/a";
+
+            if (instance == null || type == null)
+            {
+                return false;
+            }
+
+            var flags = Il2CppBindingFlags.Instance | Il2CppBindingFlags.Public | Il2CppBindingFlags.NonPublic;
+            var current = type;
+
+            while (current != null)
+            {
+                Il2CppSystem.Reflection.FieldInfo? field = null;
+                try
+                {
+                    field = current.GetField(fieldName, flags);
+                }
+                catch
+                {
+                    field = null;
+                }
+
+                if (field != null)
+                {
+                    fieldType = field.FieldType?.FullName ?? "unknown";
+                    try
+                    {
+                        var value = field.GetValue(instance);
+                        valueType = DescribeObject(value);
+                        if (TryConvertVector(value, out var converted))
+                        {
+                            vectorValue = $"{converted.x:F4},{converted.y:F4}";
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        valueType = $"error:{ex.Message}";
+                    }
+
+                    return true;
+                }
+
+                current = current.BaseType;
+            }
+
+            return false;
+        }
+
+        private static bool TryConvertFloat(object? raw, out float value)
+        {
+            value = 0f;
+            if (raw == null)
+            {
+                return false;
+            }
+
+            switch (raw)
+            {
+                case float f:
+                    value = f;
+                    return true;
+                case double d:
+                    value = (float)d;
+                    return true;
+                case int i:
+                    value = i;
+                    return true;
+                case uint ui:
+                    value = ui;
+                    return true;
+                case long l:
+                    value = l;
+                    return true;
+                case ulong ul:
+                    value = ul;
+                    return true;
+                case short s:
+                    value = s;
+                    return true;
+                case ushort us:
+                    value = us;
+                    return true;
+                case byte b:
+                    value = b;
+                    return true;
+                case sbyte sb:
+                    value = sb;
+                    return true;
+                case Il2CppValueField<float> floatField:
+                    value = floatField.Value;
+                    return true;
+                case Il2CppValueField<double> doubleField:
+                    value = (float)doubleField.Value;
+                    return true;
+            }
+
+            if (raw is IConvertible convertible)
+            {
+                try
+                {
+                    value = convertible.ToSingle(CultureInfo.InvariantCulture);
+                    return true;
+                }
+                catch
+                {
+                }
+            }
+
+            try
+            {
+                value = Convert.ToSingle(raw, CultureInfo.InvariantCulture);
+                return true;
+            }
+            catch
+            {
+                if (raw is string str && float.TryParse(str, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+                {
+                    value = parsed;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        internal static Vector2 ToVector2(Vector3 value)
+        {
+            return new Vector2(value.x, value.y);
+        }
+    }
+
+    internal readonly struct PlayerSnapshot
+    {
+        internal static readonly PlayerSnapshot Empty = new PlayerSnapshot(null, Vector2.zero, Vector2.zero, 0f, 0f);
+
+        internal PlayerSnapshot(CharacterController? controller, Vector2 position, Vector2 velocity, float radius, float moveSpeed)
+        {
+            Controller = controller;
+            Position = position;
+            Velocity = velocity;
+            Radius = radius;
+            MoveSpeed = moveSpeed;
+        }
+
+        internal CharacterController? Controller { get; }
+        internal Vector2 Position { get; }
+        internal Vector2 Velocity { get; }
+        internal float Radius { get; }
+        internal float MoveSpeed { get; }
+        internal bool IsValid => Controller != null && !Controller.Equals(null);
+    }
+
+    internal readonly struct GemSnapshot
+    {
+        internal GemSnapshot(Vector2 position, float radius, bool collectible)
+        {
+            Position = position;
+            Radius = radius;
+            IsCollectible = collectible;
+        }
+
+        internal Vector2 Position { get; }
+        internal float Radius { get; }
+        internal bool IsCollectible { get; }
+    }
+
+    internal readonly struct DynamicObstacle
+    {
+        internal DynamicObstacle(Vector2 position, Vector2 velocity, float radius, ObstacleKind kind)
+        {
+            Position = position;
+            Velocity = velocity;
+            Radius = radius;
+            Kind = kind;
+        }
+
+        internal Vector2 Position { get; }
+        internal Vector2 Velocity { get; }
+        internal float Radius { get; }
+        internal ObstacleKind Kind { get; }
+    }
+
+    internal readonly struct WallSegment
+    {
+        internal WallSegment(Rect bounds)
+        {
+            Bounds = bounds;
+        }
+
+        internal Rect Bounds { get; }
+    }
+
+    internal enum ObstacleKind
+    {
+        Enemy,
+        Bullet
+    }
+
+    internal static class BulletTypeCatalog
+    {
+        internal static readonly Il2CppSystem.Type[] Types =
+        {
+            Il2CppType.Of<Il2CppVampireSurvivors.Objects.Characters.Enemies.EnemyBullet1>(),
+            Il2CppType.Of<Il2CppVampireSurvivors.Objects.Characters.Enemies.EnemyBulletW>(),
+        };
+    }
+
+    internal sealed class FallbackLogger
+    {
+        private readonly HashSet<string> _warned = new HashSet<string>();
+        private readonly HashSet<string> _info = new HashSet<string>();
+
+        internal void ResetTransient()
+        {
+            _info.Clear();
+        }
+
+        internal void WarnOnce(string key, string message)
+        {
+            if (_warned.Add(key))
+            {
+                MelonLogger.Warning(message);
+            }
+        }
+
+        internal void InfoOnce(string key, string message)
+        {
+            if (_info.Add(key))
+            {
+                MelonLogger.Msg(message);
+            }
+        }
+    }
+}

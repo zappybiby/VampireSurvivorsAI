@@ -1,0 +1,85 @@
+## OS junk
+.DS_Store
+Thumbs.db
+
+## IDEs & editors
+.vs/                         # Visual Studio cache
+.vscode/                     # VS Code workspace (keep if you prefer)
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/                       # JetBrains Rider / IntelliJ
+*.sln.iml
+_ReSharper.Caches/
+*.DotSettings.user
+
+## Build outputs
+[Bb]in/
+[Oo]bj/
+[Bb]uild/
+[Bb]ld/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+[Ll]og/
+[Ll]ogs/
+artifacts/
+[Bb]enchmarkDotNet.Artifacts/
+
+## Packages (generated)
+*.nupkg
+*.snupkg
+# If you publish packages from this repo, remove the lines above.
+
+## NuGet & MSBuild
+project.lock.json
+project.fragment.lock.json
+*.nuget.props
+*.nuget.targets
+.nuget/
+
+## Test results & coverage
+[Tt]est[Rr]esult*/
+[Tt]est[Rr]esults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+.vscode-test/
+
+## User-specific files
+*.user
+*.userosscache
+*.suo
+*.rsuser
+*.userprefs
+*.swp
+*.tmp
+*.temp
+
+## Reports & tooling caches
+.sonarqube/
+.scannerwork/
+.stylecop/
+StyleCopReport.xml
+
+## Publish & deployment
+[Pp]ublish/
+**/Properties/PublishProfiles/*.pubxml
+**/Properties/PublishProfiles/*.pubxml.user
+
+## ASP.NET / config overrides (keep production config in repo)
+appsettings.*.local.json
+*.local.json
+**/*.secrets.json
+secrets.json
+
+## Optional: ignore tool-specific outputs found in your tree
+# repomix output
+repomix-output.xml
+
+## Misc
+*.orig
+*.bak

@@ -1,0 +1,382 @@
+using Il2CppInterop.Runtime;
+using Il2CppInterop.Runtime.Attributes;
+using Il2CppInterop.Runtime.Injection;
+using MelonLoader;
+using System;
+using System.Collections.Generic;
+using System.Text;
+using UnityEngine;
+
+namespace AI_Mod.Runtime
+{
+    internal sealed class AiDebugOverlay : MonoBehaviour
+    {
+        private const KeyCode ToggleKey = KeyCode.F6;
+        private const float PanelWidth = 320f;
+        private const float PanelMargin = 12f;
+        private const float PanelBackgroundAlpha = 0.55f;
+        private const float LineThickness = 2f;
+
+        private readonly Color _panelColor = new Color(0f, 0f, 0f, PanelBackgroundAlpha);
+        private readonly Color _textColor = Color.white;
+        private readonly Color _pathColor = new Color(0.1f, 0.85f, 1f, 0.95f);
+        private readonly Color _enemyColor = new Color(0.9f, 0.25f, 0.25f, 0.95f);
+        private readonly Color _bulletColor = new Color(1f, 0.65f, 0.1f, 0.9f);
+        private readonly Color _gemColor = new Color(0.2f, 0.95f, 0.2f, 0.95f);
+        private readonly Color _playerColor = new Color(0.95f, 0.95f, 0.95f, 0.95f);
+        private readonly StringBuilder _buffer = new StringBuilder(256);
+        private readonly FallbackLogger _fallbacks = new FallbackLogger();
+
+        private bool _visible;
+        private Camera? _targetCamera;
+        private Texture2D? _pixel;
+        private GUIStyle? _labelStyle;
+
+        public AiDebugOverlay(IntPtr pointer) : base(pointer)
+        {
+        }
+
+        public AiDebugOverlay() : base(ClassInjector.DerivedConstructorPointer<AiDebugOverlay>())
+        {
+            ClassInjector.DerivedConstructorBody(this);
+        }
+
+        private void Awake()
+        {
+            DontDestroyOnLoad(gameObject);
+            gameObject.hideFlags = HideFlags.HideAndDontSave;
+            _pixel = CreatePixelTexture();
+            MelonLogger.Msg("AI debug overlay ready.");
+        }
+
+        private void OnDestroy()
+        {
+            if (_pixel != null)
+            {
+                Destroy(_pixel);
+                _pixel = null;
+            }
+        }
+
+        private void Update()
+        {
+            if (Input.GetKeyDown(ToggleKey))
+            {
+                _visible = !_visible;
+                MelonLogger.Msg($"AI debug overlay toggled {( _visible ? "on" : "off" )} via {ToggleKey}.");
+            }
+
+            if (_visible)
+            {
+                RefreshCamera();
+            }
+        }
+
+        private void OnGUI()
+        {
+            if (!_visible || Event.current == null || Event.current.type != EventType.Repaint)
+            {
+                return;
+            }
+
+            var controller = AiRuntime.Controller;
+            if (controller == null)
+            {
+                DrawStatusBanner("Controller not available. TODO: ensure AiController is attached.");
+                return;
+            }
+
+            EnsureLabelStyle();
+            DrawSummaryPanel(controller);
+
+            var camera = _targetCamera;
+            if (camera == null)
+            {
+                DrawStatusBanner("Camera unresolved. TODO: verify camera discovery.");
+                return;
+            }
+
+            DrawWorldMarkers(controller, camera);
+        }
+
+        private void DrawSummaryPanel(AiController controller)
+        {
+            var world = controller.WorldState;
+            var debug = controller.PlannerDebug;
+            var planDirection = controller.LastPlan.Direction;
+
+            _buffer.Clear();
+            _buffer.AppendLine("AI Debug Overlay");
+            _buffer.Append("Gameplay Active: ").Append(controller.IsGameplayActive).AppendLine();
+            _buffer.Append("Game State: ").Append(controller.CurrentGameState ?? "<unknown>").AppendLine();
+            _buffer.Append("Player Known: ").Append(world.Player.IsValid).AppendLine();
+            _buffer.Append("Player Pos: ").Append(world.Player.Position.x.ToString("F2")).Append(", ").Append(world.Player.Position.y.ToString("F2")).AppendLine();
+            _buffer.Append("Player Vel: ").Append(world.Player.Velocity.x.ToString("F2")).Append(", ").Append(world.Player.Velocity.y.ToString("F2")).AppendLine();
+            _buffer.Append("Desired Dir: ").Append(planDirection.x.ToString("F2")).Append(", ").Append(planDirection.y.ToString("F2")).AppendLine();
+            _buffer.Append("Planner Score: ").Append(debug.HasBest ? debug.BestScore.ToString("F2") : "n/a").AppendLine();
+            _buffer.Append("Candidates: ").Append(debug.Candidates.Count).AppendLine();
+            _buffer.Append("Enemies: ").Append(world.EnemyObstacles.Count).Append(" | Bullets: ").Append(world.BulletObstacles.Count).AppendLine();
+            _buffer.Append("Gems: ").Append(world.Gems.Count).Append(" | Walls: ").Append(world.Walls.Count).AppendLine();
+
+            var panelHeight = 170f;
+            var rect = new Rect(PanelMargin, PanelMargin, PanelWidth, panelHeight);
+            DrawFilledRect(rect, _panelColor);
+            GUI.Label(new Rect(rect.x + 8f, rect.y + 6f, rect.width - 12f, rect.height - 12f), _buffer.ToString(), _labelStyle);
+        }
+
+        private void DrawWorldMarkers(AiController controller, Camera camera)
+        {
+            var world = controller.WorldState;
+            var debug = controller.PlannerDebug;
+
+            if (world.Player.IsValid && TryWorldToGui(world.Player.Position, camera, out var playerScreen))
+            {
+                var radius = ResolveScreenRadius(world.Player.Position, world.Player.Radius, camera, 6f, "OverlayPlayerRadiusFallback", "player marker");
+                DrawDisc(playerScreen, radius, _playerColor);
+                if (debug.HasBest && debug.BestDirection.sqrMagnitude > 0.0001f)
+                {
+                    var pathStart = playerScreen;
+                    var direction = debug.BestDirection.normalized;
+                    const float arrowLength = 65f;
+                    var pathEnd = pathStart + direction * arrowLength;
+                    DrawLine(pathStart, pathEnd, _pathColor, LineThickness);
+                }
+            }
+
+            if (debug.HasBest)
+            {
+                DrawTrajectory(debug.BestTrajectory, camera, _pathColor);
+            }
+
+            for (var i = 0; i < world.EnemyObstacles.Count; i++)
+            {
+                var obstacle = world.EnemyObstacles[i];
+                if (TryWorldToGui(obstacle.Position, camera, out var enemyScreen))
+                {
+                    var radius = ResolveScreenRadius(obstacle.Position, obstacle.Radius, camera, 4f, "OverlayEnemyRadiusFallback", "enemy marker");
+                    DrawDisc(enemyScreen, radius, _enemyColor);
+                }
+            }
+
+            for (var i = 0; i < world.BulletObstacles.Count; i++)
+            {
+                var obstacle = world.BulletObstacles[i];
+                if (TryWorldToGui(obstacle.Position, camera, out var bulletScreen))
+                {
+                    var radius = ResolveScreenRadius(obstacle.Position, obstacle.Radius, camera, 3f, "OverlayBulletRadiusFallback", "bullet marker");
+                    DrawDisc(bulletScreen, radius, _bulletColor);
+                }
+            }
+
+            for (var i = 0; i < world.Gems.Count; i++)
+            {
+                var gem = world.Gems[i];
+                if (!gem.IsCollectible)
+                {
+                    continue;
+                }
+
+                if (TryWorldToGui(gem.Position, camera, out var gemScreen))
+                {
+                    var radius = ResolveScreenRadius(gem.Position, gem.Radius, camera, 3f, "OverlayGemRadiusFallback", "gem marker");
+                    DrawDisc(gemScreen, radius, _gemColor);
+                }
+            }
+
+        }
+
+        [HideFromIl2Cpp]
+        private void DrawTrajectory(IReadOnlyList<Vector2> trajectory, Camera camera, Color color)
+        {
+            if (trajectory == null || trajectory.Count < 2)
+            {
+                return;
+            }
+
+            Vector2? previous = null;
+            for (var i = 0; i < trajectory.Count; i++)
+            {
+                var node = trajectory[i];
+                if (!TryWorldToGui(node, camera, out var screen))
+                {
+                    previous = null;
+                    continue;
+                }
+
+                DrawDisc(screen, 4f, color);
+
+                if (previous.HasValue)
+                {
+                    DrawLine(previous.Value, screen, color, LineThickness * 0.75f);
+                }
+
+                previous = screen;
+            }
+        }
+
+        private void DrawDisc(Vector2 center, float radius, Color color)
+        {
+            if (_pixel == null)
+            {
+                return;
+            }
+
+            var size = radius * 2f;
+            var rect = new Rect(center.x - radius, center.y - radius, size, size);
+            var cachedColor = GUI.color;
+            GUI.color = color;
+            GUI.DrawTexture(rect, _pixel);
+            GUI.color = cachedColor;
+        }
+
+        private void DrawLine(Vector2 from, Vector2 to, Color color, float thickness)
+        {
+            if (_pixel == null)
+            {
+                return;
+            }
+
+            var delta = to - from;
+            var length = delta.magnitude;
+            if (length <= 0.001f)
+            {
+                return;
+            }
+
+            var angle = Mathf.Atan2(delta.y, delta.x) * Mathf.Rad2Deg;
+            var rect = new Rect(from.x, from.y - thickness * 0.5f, length, thickness);
+
+            var matrix = GUI.matrix;
+            GUIUtility.RotateAroundPivot(angle, from);
+
+            var cachedColor = GUI.color;
+            GUI.color = color;
+            GUI.DrawTexture(rect, _pixel);
+            GUI.color = cachedColor;
+
+            GUI.matrix = matrix;
+        }
+
+        private void DrawStatusBanner(string message)
+        {
+            var rect = new Rect(PanelMargin, PanelMargin, PanelWidth, 40f);
+            DrawFilledRect(rect, _panelColor);
+            GUI.Label(new Rect(rect.x + 8f, rect.y + 10f, rect.width - 16f, rect.height - 20f), message, _labelStyle);
+        }
+
+        private void DrawFilledRect(Rect rect, Color color)
+        {
+            if (_pixel == null)
+            {
+                return;
+            }
+
+            var cachedColor = GUI.color;
+            GUI.color = color;
+            GUI.DrawTexture(rect, _pixel);
+            GUI.color = cachedColor;
+        }
+
+        private void EnsureLabelStyle()
+        {
+            if (_labelStyle != null)
+            {
+                return;
+            }
+
+            _labelStyle = new GUIStyle(GUI.skin.label)
+            {
+                fontSize = 14,
+                normal = { textColor = _textColor },
+                richText = false,
+                alignment = TextAnchor.UpperLeft
+            };
+        }
+
+        private void RefreshCamera()
+        {
+            if (_targetCamera != null && !_targetCamera.Equals(null) && _targetCamera.isActiveAndEnabled)
+            {
+                return;
+            }
+
+            var camera = Camera.main;
+            if (camera != null)
+            {
+                _targetCamera = camera;
+                return;
+            }
+
+            _fallbacks.WarnOnce("CameraMainMissing", "Camera.main missing; searching all cameras for fallback. TODO: confirm camera tagging.");
+
+            var cameras = UnityEngine.Object.FindObjectsOfType<Camera>();
+            for (var i = 0; i < cameras.Length; i++)
+            {
+                var candidate = cameras[i];
+                if (candidate != null && candidate.enabled && candidate.gameObject != null && candidate.gameObject.activeInHierarchy)
+                {
+                    _targetCamera = candidate;
+                    _fallbacks.InfoOnce("CameraFallback", $"Using fallback camera '{candidate.gameObject.name}'.");
+                    return;
+                }
+            }
+
+            _fallbacks.WarnOnce("CameraUnavailable", "No active camera located for overlay rendering.");
+        }
+
+        private float ResolveScreenRadius(Vector2 worldPos, float worldRadius, Camera camera, float minimumPixels, string fallbackKey, string description)
+        {
+            if (TryWorldRadiusToPixels(worldPos, worldRadius, camera, out var pixels))
+            {
+                return Mathf.Max(minimumPixels, pixels);
+            }
+
+            _fallbacks.InfoOnce(fallbackKey, $"Overlay fallback: unable to compute screen radius for {description}; using {minimumPixels}px marker. TODO: verify camera projection.");
+            return minimumPixels;
+        }
+
+        private static Texture2D CreatePixelTexture()
+        {
+            var texture = new Texture2D(1, 1, TextureFormat.RGBA32, false)
+            {
+                hideFlags = HideFlags.HideAndDontSave,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            texture.SetPixel(0, 0, Color.white);
+            texture.Apply();
+            return texture;
+        }
+
+        private static bool TryWorldToGui(Vector2 worldPos, Camera camera, out Vector2 guiPos)
+        {
+            var screen = camera.WorldToScreenPoint(new Vector3(worldPos.x, worldPos.y, 0f));
+            if (screen.z < 0f)
+            {
+                guiPos = Vector2.zero;
+                return false;
+            }
+
+            guiPos = new Vector2(screen.x, Screen.height - screen.y);
+            return true;
+        }
+
+        private static bool TryWorldRadiusToPixels(Vector2 worldPos, float radius, Camera camera, out float pixelRadius)
+        {
+            pixelRadius = 0f;
+            if (radius <= 0f)
+            {
+                return false;
+            }
+
+            if (!TryWorldToGui(worldPos, camera, out var center) ||
+                !TryWorldToGui(worldPos + new Vector2(radius, 0f), camera, out var edge))
+            {
+                return false;
+            }
+
+            pixelRadius = Mathf.Abs(edge.x - center.x);
+            return pixelRadius > 0.1f;
+        }
+    }
+}
