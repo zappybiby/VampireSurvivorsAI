@@ -16,11 +16,16 @@ namespace AI_Mod.Runtime
         private const float PanelMargin = 12f;
         private const float PanelBackgroundAlpha = 0.55f;
         private const float LineThickness = 2f;
+        private const float GemMarkerScale = 0.78f;
+        private const float EnemyCoreMinimumSize = 3f;
+        private const float EnemyCoreWidthFactor = 0.55f;
+        private const float EnemyCoreHeightFactor = 0.4f;
 
         private readonly Color _panelColor = new Color(0f, 0f, 0f, PanelBackgroundAlpha);
         private readonly Color _textColor = Color.white;
         private readonly Color _pathColor = new Color(0.1f, 0.85f, 1f, 0.95f);
-        private readonly Color _enemyColor = new Color(0.9f, 0.25f, 0.25f, 0.95f);
+        private readonly Color _enemyColor = new Color(0.9f, 0.25f, 0.25f, 0.82f);
+        private readonly Color _enemyCoreColor = new Color(1f, 0.3f, 0.35f, 0.95f);
         private readonly Color _bulletColor = new Color(1f, 0.65f, 0.1f, 0.9f);
         private readonly Color _gemColor = new Color(0.2f, 0.95f, 0.2f, 0.95f);
         private readonly Color _playerColor = new Color(0.95f, 0.95f, 0.95f, 0.95f);
@@ -204,6 +209,12 @@ namespace AI_Mod.Runtime
                 {
                     var radius = ResolveScreenRadius(obstacle.Position, obstacle.Radius, camera, renderRect, sourceSize, 4f, "OverlayEnemyRadiusFallback", "enemy marker");
                     DrawDisc(enemyScreen, radius, _enemyColor);
+
+                    var coreWidth = Mathf.Max(EnemyCoreMinimumSize, radius * EnemyCoreWidthFactor);
+                    var coreHeight = Mathf.Max(EnemyCoreMinimumSize * 0.6f, radius * EnemyCoreHeightFactor);
+                    coreWidth = Mathf.Min(coreWidth, Mathf.Max(EnemyCoreMinimumSize, radius * 0.9f));
+                    coreHeight = Mathf.Min(coreHeight, Mathf.Max(EnemyCoreMinimumSize * 0.6f, radius * 0.6f));
+                    DrawCenteredRect(enemyScreen, coreWidth, coreHeight, _enemyCoreColor);
                 }
             }
 
@@ -228,6 +239,7 @@ namespace AI_Mod.Runtime
                 if (TryWorldToGui(gem.Position, camera, renderRect, sourceSize, out var gemScreen))
                 {
                     var radius = ResolveScreenRadius(gem.Position, gem.Radius, camera, renderRect, sourceSize, 3f, "OverlayGemRadiusFallback", "gem marker");
+                    radius = Mathf.Max(1.5f, radius * GemMarkerScale);
                     DrawDisc(gemScreen, radius, _gemColor);
                 }
             }
@@ -283,13 +295,42 @@ namespace AI_Mod.Runtime
 
         private void DrawDisc(Vector2 center, float radius, Color color)
         {
-            if (_pixel == null)
+            if (_pixel == null || radius <= 0f)
             {
                 return;
             }
 
-            var size = radius * 2f;
-            var rect = new Rect(center.x - radius, center.y - radius, size, size);
+            var cachedColor = GUI.color;
+            GUI.color = color;
+
+            var ceilRadius = Mathf.CeilToInt(radius);
+            var radiusSquared = radius * radius;
+            for (var y = -ceilRadius; y <= ceilRadius; y++)
+            {
+                var offsetY = y + 0.5f;
+                var span = radiusSquared - offsetY * offsetY;
+                if (span < 0f)
+                {
+                    continue;
+                }
+
+                var halfWidth = Mathf.Sqrt(Mathf.Max(0f, span));
+                var width = Mathf.Max(1f, halfWidth * 2f);
+                var rect = new Rect(center.x - halfWidth, center.y + y - 0.5f, width, 1f);
+                GUI.DrawTexture(rect, _pixel);
+            }
+
+            GUI.color = cachedColor;
+        }
+
+        private void DrawCenteredRect(Vector2 center, float width, float height, Color color)
+        {
+            if (_pixel == null || width <= 0f || height <= 0f)
+            {
+                return;
+            }
+
+            var rect = new Rect(center.x - width * 0.5f, center.y - height * 0.5f, width, height);
             var cachedColor = GUI.color;
             GUI.color = color;
             GUI.DrawTexture(rect, _pixel);
