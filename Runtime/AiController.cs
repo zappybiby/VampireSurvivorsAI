@@ -14,16 +14,20 @@ namespace AI_Mod.Runtime
     internal sealed class AiController : MonoBehaviour
     {
         private const float WorldRefreshIntervalSeconds = 0.2f;
+        private const float DebugLogIntervalSeconds = 1f;
 
         private readonly AiWorldState _world = new AiWorldState();
         private readonly VelocityObstaclePlanner _planner = new VelocityObstaclePlanner();
         private readonly AiGameStateMonitor _stateMonitor = new AiGameStateMonitor();
         private readonly KitingPlanner _kitingPlanner = new KitingPlanner();
+        private readonly List<WallDistanceInfo> _wallDistanceBuffer = new List<WallDistanceInfo>(8);
+        private readonly List<WallDistanceInfo> _playerWallDistanceBuffer = new List<WallDistanceInfo>(4);
 
         private CharacterController? _player;
         private Vector2 _desiredDirection = Vector2.zero;
         private PlannerResult _lastPlan = PlannerResult.Zero;
         private float _lastWorldSyncTime;
+        private float _lastDebugLogTime;
         private int _lastPlannedWorldVersion = -1;
         private bool _playerLookupWarned;
         private bool _kitingFallbackActive;
@@ -76,6 +80,7 @@ namespace AI_Mod.Runtime
             EnsurePlayerReference();
             if (_player == null)
             {
+                MaybeLogDebugInfo();
                 return;
             }
 
@@ -143,6 +148,8 @@ namespace AI_Mod.Runtime
                     _breakoutActive = false;
                 }
             }
+
+            MaybeLogDebugInfo();
         }
 
         private void LateUpdate()
@@ -222,6 +229,231 @@ namespace AI_Mod.Runtime
             _player._currentDirectionRaw = direction;
             _player._lastMovementDirection = direction;
             _player._lastFacingDirection = direction;
+        }
+
+        private void MaybeLogDebugInfo()
+        {
+            if (Time.unscaledTime - _lastDebugLogTime < DebugLogIntervalSeconds)
+            {
+                return;
+            }
+
+            _lastDebugLogTime = Time.unscaledTime;
+
+            var plannerDebug = _planner.DebugInfo;
+            MelonLogger.Msg($"AI Debug Mode: {_lastPlan.Mode}");
+
+            if (plannerDebug.HasBest)
+            {
+                MelonLogger.Msg($"AI Debug Planner Score: {plannerDebug.BestScore:F2}");
+                MelonLogger.Msg($"AI Debug Planned Steps: {FormatTrajectorySteps(plannerDebug.BestTrajectory)}");
+            }
+            else
+            {
+                MelonLogger.Msg("AI Debug Planner Score: fallback active (no planner result ready).");
+                MelonLogger.Msg("AI Debug Planned Steps: fallback active (no planner trajectory recorded).");
+            }
+
+            var playerSnapshot = _world.Player;
+            if (playerSnapshot.IsValid)
+            {
+                var position = playerSnapshot.Position;
+                MelonLogger.Msg($"AI Debug Player Position: ({position.x:F2}, {position.y:F2})");
+
+                CollectWallDistances(position, playerSnapshot.Radius, playerWalls: false, _wallDistanceBuffer);
+                MelonLogger.Msg($"AI Debug Nearest Walls: {FormatWallDistanceList(_wallDistanceBuffer)}");
+
+                CollectWallDistances(position, playerSnapshot.Radius, playerWalls: true, _playerWallDistanceBuffer);
+                MelonLogger.Msg($"AI Debug Nearest PlayerWalls: {FormatWallDistanceList(_playerWallDistanceBuffer)}");
+            }
+            else
+            {
+                MelonLogger.Msg("AI Debug Player Position: fallback active (player snapshot invalid).");
+                MelonLogger.Msg("AI Debug Nearest Walls: fallback active (player snapshot unavailable).");
+                MelonLogger.Msg("AI Debug Nearest PlayerWalls: fallback active (player snapshot unavailable).");
+            }
+        }
+
+        private void CollectWallDistances(Vector2 playerPosition, float playerRadius, bool playerWalls, List<WallDistanceInfo> destination)
+        {
+            destination.Clear();
+
+            var tilemaps = _world.WallTilemaps;
+            if (tilemaps.Count == 0)
+            {
+                return;
+            }
+
+            var safeRadius = Mathf.Max(playerRadius + VelocityObstaclePlanner.MinimumSeparation, 0f);
+            var radiusSquared = Mathf.Max(playerRadius * playerRadius, 0f);
+
+            for (var i = 0; i < tilemaps.Count; i++)
+            {
+                var entry = tilemaps[i];
+                var tilemap = entry.Tilemap;
+                if (tilemap == null || tilemap.Equals(null))
+                {
+                    continue;
+                }
+
+                var go = tilemap.gameObject;
+                var rawName = go != null && !go.Equals(null) ? go.name ?? "<unnamed>" : "<missing>";
+                var isPlayerWall = rawName.IndexOf("PlayerWall", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                if (playerWalls)
+                {
+                    if (!isPlayerWall)
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    if (isPlayerWall)
+                    {
+                        continue;
+                    }
+
+                    if (rawName.IndexOf("Walls", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        continue;
+                    }
+                }
+
+                var boundingBoxes = entry.BoundingBoxes;
+                if (boundingBoxes == null || boundingBoxes.Length == 0)
+                {
+                    continue;
+                }
+
+                if (safeRadius > 0f && !WallGeometry.CircleIntersectsBounds(playerPosition, safeRadius, entry.WorldBounds))
+                {
+                    continue;
+                }
+
+                var bestDistanceSquared = float.PositiveInfinity;
+                var bestPoint = Vector2.zero;
+                for (var j = 0; j < boundingBoxes.Length; j++)
+                {
+                    var rect = boundingBoxes[j];
+                    var distanceSquared = WallGeometry.DistanceSquaredToRect(rect, playerPosition);
+
+                    if (distanceSquared <= radiusSquared)
+                    {
+                        bestPoint = WallGeometry.ClosestPointOnRect(rect, playerPosition);
+                        bestDistanceSquared = 0f;
+                        break;
+                    }
+
+                    if (distanceSquared < bestDistanceSquared)
+                    {
+                        bestPoint = WallGeometry.ClosestPointOnRect(rect, playerPosition);
+                        bestDistanceSquared = distanceSquared;
+                    }
+                }
+
+                if (!float.IsFinite(bestDistanceSquared))
+                {
+                    continue;
+                }
+
+                var bestDistance = bestDistanceSquared > 0f ? Mathf.Sqrt(bestDistanceSquared) : 0f;
+                destination.Add(new WallDistanceInfo(rawName, bestDistance, bestPoint));
+            }
+
+            if (destination.Count <= 1)
+            {
+                return;
+            }
+
+            destination.Sort((left, right) => left.Distance.CompareTo(right.Distance));
+        }
+
+        private static string FormatWallDistanceList(List<WallDistanceInfo> entries)
+        {
+            if (entries.Count == 0)
+            {
+                return "fallback active (no matching wall tilemaps)";
+            }
+
+            var builder = new System.Text.StringBuilder(entries.Count * 48);
+            for (var i = 0; i < entries.Count; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(" | ");
+                }
+
+                var entry = entries[i];
+                builder.Append(entry.Name)
+                    .Append(':')
+                    .Append(' ')
+                    .Append(entry.Distance.ToString("F2"))
+                    .Append(" @ (")
+                    .Append(entry.ClosestPoint.x.ToString("F2"))
+                    .Append(", ")
+                    .Append(entry.ClosestPoint.y.ToString("F2"))
+                    .Append(')');
+            }
+
+            return builder.ToString();
+        }
+
+        private static string FormatTrajectorySteps(IReadOnlyList<Vector2> trajectory)
+        {
+            if (trajectory == null)
+            {
+                return "fallback active: trajectory list unavailable";
+            }
+
+            var availableSteps = trajectory.Count - 1;
+            if (availableSteps <= 0)
+            {
+                return "fallback active: trajectory contains no steps";
+            }
+
+            var stepsToReport = Mathf.Min(2, availableSteps);
+            var builder = new System.Text.StringBuilder(stepsToReport * 48);
+
+            for (var i = 0; i < stepsToReport; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(" | ");
+                }
+
+                var point = trajectory[i + 1];
+                builder.Append("Step ")
+                    .Append(i + 1)
+                    .Append(':')
+                    .Append(' ')
+                    .Append('(')
+                    .Append(point.x.ToString("F2"))
+                    .Append(", ")
+                    .Append(point.y.ToString("F2"))
+                    .Append(')');
+            }
+
+            if (availableSteps < 2)
+            {
+                builder.Append(" | fallback active: trajectory shorter than two steps");
+            }
+
+            return builder.ToString();
+        }
+
+        private readonly struct WallDistanceInfo
+        {
+            internal WallDistanceInfo(string name, float distance, Vector2 closestPoint)
+            {
+                Name = name;
+                Distance = distance;
+                ClosestPoint = closestPoint;
+            }
+
+            internal string Name { get; }
+            internal float Distance { get; }
+            internal Vector2 ClosestPoint { get; }
         }
     }
 
@@ -341,11 +573,11 @@ namespace AI_Mod.Runtime
     internal sealed class VelocityObstaclePlanner
     {
         private const int DirectionSamples = 20;
-        private const float SimulationStep = 0.1f;
+        private const float SimulationStep = 0.2f;
         private const int SimulationSteps = 8;
         private const float SimulationDuration = SimulationSteps * SimulationStep;
-        private const float MinimumSeparation = 1.5f;
-        private const float WallPenaltyWeight = 60f;
+        internal const float MinimumSeparation = 0.66f;
+        private const float WallPenaltyWeight = 100f;
         private const float GemRewardWeight = 12f;
         private const float OverlapPenaltyScale = GemRewardWeight;
         private const float BreakoutRewardScale = GemRewardWeight;
@@ -681,7 +913,7 @@ namespace AI_Mod.Runtime
                     continue;
                 }
 
-                if (CircleIntersectsBounds(center, radius, entry.WorldBounds))
+                if (WallGeometry.CircleIntersectsBounds(center, radius, entry.WorldBounds))
                 {
                     destination.Add(entry);
                 }
@@ -781,7 +1013,7 @@ namespace AI_Mod.Runtime
                     continue;
                 }
 
-                if (!CircleIntersectsBounds(position, safeRadius, entry.WorldBounds))
+                if (!WallGeometry.CircleIntersectsBounds(position, safeRadius, entry.WorldBounds))
                 {
                     continue;
                 }
@@ -789,7 +1021,7 @@ namespace AI_Mod.Runtime
                 for (var j = 0; j < boundingBoxes.Length; j++)
                 {
                     var rect = boundingBoxes[j];
-                    var distanceSquared = DistanceSquaredToRect(rect, position);
+                    var distanceSquared = WallGeometry.DistanceSquaredToRect(rect, position);
 
                     if (distanceSquared <= radiusSquared)
                     {
@@ -816,46 +1048,6 @@ namespace AI_Mod.Runtime
             }
 
             return penalty;
-        }
-
-        private static bool CircleIntersectsBounds(Vector2 center, float radius, Bounds bounds)
-        {
-            var query = new Vector3(center.x, center.y, bounds.center.z);
-            if (radius <= 0f)
-            {
-                return bounds.Contains(query);
-            }
-
-            var closest = bounds.ClosestPoint(query);
-            var dx = closest.x - center.x;
-            var dy = closest.y - center.y;
-            var radiusSquared = radius * radius;
-            return dx * dx + dy * dy <= radiusSquared;
-        }
-
-        private static float DistanceSquaredToRect(Rect rect, Vector2 point)
-        {
-            var dx = 0f;
-            if (point.x < rect.xMin)
-            {
-                dx = rect.xMin - point.x;
-            }
-            else if (point.x > rect.xMax)
-            {
-                dx = point.x - rect.xMax;
-            }
-
-            var dy = 0f;
-            if (point.y < rect.yMin)
-            {
-                dy = rect.yMin - point.y;
-            }
-            else if (point.y > rect.yMax)
-            {
-                dy = point.y - rect.yMax;
-            }
-
-            return dx * dx + dy * dy;
         }
 
         private float EvaluateGemReward(Vector2 position, IReadOnlyList<GemSnapshot> gems)
@@ -977,6 +1169,56 @@ namespace AI_Mod.Runtime
             }
 
             return 0f;
+        }
+    }
+
+    internal static class WallGeometry
+    {
+        internal static bool CircleIntersectsBounds(Vector2 center, float radius, Bounds bounds)
+        {
+            var query = new Vector3(center.x, center.y, bounds.center.z);
+            if (radius <= 0f)
+            {
+                return bounds.Contains(query);
+            }
+
+            var closest = bounds.ClosestPoint(query);
+            var dx = closest.x - center.x;
+            var dy = closest.y - center.y;
+            var radiusSquared = radius * radius;
+            return dx * dx + dy * dy <= radiusSquared;
+        }
+
+        internal static float DistanceSquaredToRect(Rect rect, Vector2 point)
+        {
+            var dx = 0f;
+            if (point.x < rect.xMin)
+            {
+                dx = rect.xMin - point.x;
+            }
+            else if (point.x > rect.xMax)
+            {
+                dx = point.x - rect.xMax;
+            }
+
+            var dy = 0f;
+            if (point.y < rect.yMin)
+            {
+                dy = rect.yMin - point.y;
+            }
+            else if (point.y > rect.yMax)
+            {
+                dy = point.y - rect.yMax;
+            }
+
+            return dx * dx + dy * dy;
+        }
+
+        internal static Vector2 ClosestPointOnRect(Rect rect, Vector2 point)
+        {
+            var clampedX = Mathf.Clamp(point.x, rect.xMin, rect.xMax);
+            var clampedY = Mathf.Clamp(point.y, rect.yMin, rect.yMax);
+            return new Vector2(clampedX, clampedY);
         }
     }
 
