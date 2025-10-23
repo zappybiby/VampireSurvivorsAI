@@ -775,78 +775,43 @@ namespace AI_Mod.Runtime
                     continue;
                 }
 
+                var boundingBoxes = entry.BoundingBoxes;
+                if (boundingBoxes == null || boundingBoxes.Length == 0)
+                {
+                    continue;
+                }
+
                 if (!CircleIntersectsBounds(position, safeRadius, entry.WorldBounds))
                 {
                     continue;
                 }
 
-                var cellBounds = entry.CellBounds;
-                if (cellBounds.size.x <= 0 || cellBounds.size.y <= 0)
+                for (var j = 0; j < boundingBoxes.Length; j++)
                 {
-                    continue;
-                }
+                    var rect = boundingBoxes[j];
+                    var distanceSquared = DistanceSquaredToRect(rect, position);
 
-                var cell = tilemap.WorldToCell(new Vector3(position.x, position.y, tilemap.transform.position.z));
-                var cellSize = entry.CellSize;
-                var cellSizeX = Mathf.Abs(cellSize.x);
-                var cellSizeY = Mathf.Abs(cellSize.y);
-                if (cellSizeX < 0.0001f || cellSizeY < 0.0001f)
-                {
-                    continue;
-                }
-
-                var extentX = Mathf.Max(0, Mathf.CeilToInt(safeRadius / cellSizeX));
-                var extentY = Mathf.Max(0, Mathf.CeilToInt(safeRadius / cellSizeY));
-                var xMin = Mathf.Max(cellBounds.xMin, cell.x - extentX);
-                var xMax = Mathf.Min(cellBounds.xMax - 1, cell.x + extentX);
-                if (xMin > xMax)
-                {
-                    continue;
-                }
-
-                var yMin = Mathf.Max(cellBounds.yMin, cell.y - extentY);
-                var yMax = Mathf.Min(cellBounds.yMax - 1, cell.y + extentY);
-                if (yMin > yMax)
-                {
-                    continue;
-                }
-
-                var halfX = cellSizeX * 0.5f;
-                var halfY = cellSizeY * 0.5f;
-                var baseZ = cell.z;
-
-                for (var cx = xMin; cx <= xMax; cx++)
-                {
-                    for (var cy = yMin; cy <= yMax; cy++)
+                    if (distanceSquared <= radiusSquared)
                     {
-                        var candidateCell = new Vector3Int(cx, cy, baseZ);
-                        if (!tilemap.HasTile(candidateCell))
-                        {
-                            continue;
-                        }
-
-                        var worldCenter = tilemap.GetCellCenterWorld(candidateCell);
-                        var rect = new Rect(
-                            worldCenter.x - halfX,
-                            worldCenter.y - halfY,
-                            cellSizeX,
-                            cellSizeY);
-                        var distanceSquared = DistanceSquaredToRect(rect, position);
-
-                        if (distanceSquared <= radiusSquared)
-                        {
-                            return float.PositiveInfinity;
-                        }
-
-                        if (distanceSquared < safeRadiusSquared)
-                        {
-                            var distance = Mathf.Sqrt(distanceSquared);
-                            var separation = safeRadius - distance;
-                            var normalized = separation / safeRadius;
-                            var amplification = safeRadius / Mathf.Max(distance - radius, 0.001f);
-                            penalty += normalized * amplification;
-                        }
+                        return float.PositiveInfinity;
                     }
+
+                    if (distanceSquared >= safeRadiusSquared)
+                    {
+                        continue;
+                    }
+
+                    var clampedDistanceSquared = Mathf.Max(distanceSquared, 0f);
+                    var distance = clampedDistanceSquared > 0f ? Mathf.Sqrt(clampedDistanceSquared) : 0f;
+                    var separation = safeRadius - distance;
+                    if (separation <= 0f)
+                    {
+                        continue;
+                    }
+
+                    var normalized = separation / safeRadius;
+                    var amplification = safeRadius / Mathf.Max(distance - radius, 0.001f);
+                    penalty += normalized * amplification;
                 }
             }
 

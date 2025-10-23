@@ -9,6 +9,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Reflection;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Tilemaps;
 using Il2Cpp;
@@ -1060,10 +1061,11 @@ namespace AI_Mod.Runtime
                 return false;
             }
 
+            var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
+
             var grid = tilemap.layoutGrid;
             if (grid == null || grid.Equals(null))
             {
-                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
                 _fallbacks.WarnOnce($"WallTilemapGridMissing:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' missing layout grid; skipping wall registration.");
                 return false;
             }
@@ -1071,7 +1073,6 @@ namespace AI_Mod.Runtime
             var cellSize = grid.cellSize;
             if (Mathf.Abs(cellSize.x) < 0.0001f || Mathf.Abs(cellSize.y) < 0.0001f)
             {
-                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
                 _fallbacks.WarnOnce($"WallTilemapCellSizeInvalid:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' contained a near-zero cell size; skipping wall registration.");
                 return false;
             }
@@ -1083,7 +1084,6 @@ namespace AI_Mod.Runtime
             }
             catch (Exception ex)
             {
-                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
                 _fallbacks.WarnOnce($"WallTilemapUsedTilesFallback:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' GetUsedTilesCount failed: {ex.Message}; assuming tiles are present.");
                 usedTileCount = -1;
             }
@@ -1106,19 +1106,96 @@ namespace AI_Mod.Runtime
             }
             catch (Exception ex)
             {
-                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
                 _fallbacks.WarnOnce($"WallTilemapBoundsFallback:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' world bounds computation failed: {ex.Message}; skipping wall registration.");
                 return false;
             }
 
             if (bounds.size.sqrMagnitude <= 0f)
             {
-                var identifier = tilemap.gameObject != null ? tilemap.gameObject.name ?? "<unnamed>" : "<unknown>";
                 _fallbacks.WarnOnce($"WallTilemapEmptyBounds:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' produced empty world bounds; skipping wall registration.");
                 return false;
             }
 
-            wallTilemap = new WallTilemap(tilemap, bounds, cellBounds, cellSize);
+            if (!TryExtractPhaserBounds(tilemap, identifier, out var boundingBoxes))
+            {
+                return false;
+            }
+
+            wallTilemap = new WallTilemap(tilemap, bounds, boundingBoxes);
+            return true;
+        }
+
+        private bool TryExtractPhaserBounds(Tilemap tilemap, string identifier, out Rect[] boundingBoxes)
+        {
+            boundingBoxes = Array.Empty<Rect>();
+
+            var go = tilemap.gameObject;
+            if (go == null || go.Equals(null))
+            {
+                _fallbacks.WarnOnce($"WallTilemapGameObjectMissing:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' missing GameObject; skipping wall registration.");
+                return false;
+            }
+
+            var component = go.GetComponent(Il2CppType.Of<PhaserTilemap>());
+            var phaserTilemap = component?.TryCast<PhaserTilemap>();
+            if (phaserTilemap == null || phaserTilemap.Equals(null))
+            {
+                _fallbacks.WarnOnce($"WallTilemapPhaserMissing:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' missing PhaserTilemap; skipping wall registration.");
+                return false;
+            }
+
+            Il2CppStructArray<float4>? precachedBounds;
+            try
+            {
+                precachedBounds = phaserTilemap.precachedBounds;
+            }
+            catch (Exception ex)
+            {
+                _fallbacks.WarnOnce($"WallTilemapPrecBoundsError:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' precached bounds unavailable: {ex.Message}; skipping wall registration.");
+                return false;
+            }
+
+            if (precachedBounds == null || precachedBounds.Count <= 0)
+            {
+                _fallbacks.WarnOnce($"WallTilemapPrecBoundsEmpty:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' contains no precached bounds; skipping wall registration.");
+                return false;
+            }
+
+            var rects = new List<Rect>(precachedBounds.Count);
+            var discardedDegenerate = false;
+
+            for (var i = 0; i < precachedBounds.Count; i++)
+            {
+                var entry = precachedBounds[i];
+
+                var xMin = Mathf.Min(entry.x, entry.z);
+                var xMax = Mathf.Max(entry.x, entry.z);
+                var yMin = Mathf.Min(entry.y, entry.w);
+                var yMax = Mathf.Max(entry.y, entry.w);
+
+                var width = xMax - xMin;
+                var height = yMax - yMin;
+                if (width <= 0f || height <= 0f)
+                {
+                    discardedDegenerate = true;
+                    continue;
+                }
+
+                rects.Add(new Rect(xMin, yMin, width, height));
+            }
+
+            if (rects.Count == 0)
+            {
+                _fallbacks.WarnOnce($"WallTilemapPrecBoundsInvalid:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' precached bounds produced no valid rectangles; skipping wall registration.");
+                return false;
+            }
+
+            if (discardedDegenerate)
+            {
+                _fallbacks.InfoOnce($"WallTilemapPrecBoundsDiscarded:{tilemap.GetInstanceID()}", $"Tilemap '{identifier}' precached bounds contained degenerate rectangles that were discarded.");
+            }
+
+            boundingBoxes = rects.ToArray();
             return true;
         }
 
@@ -2441,18 +2518,16 @@ namespace AI_Mod.Runtime
 
     internal readonly struct WallTilemap
     {
-        internal WallTilemap(Tilemap tilemap, Bounds worldBounds, BoundsInt cellBounds, Vector3 cellSize)
+        internal WallTilemap(Tilemap tilemap, Bounds worldBounds, Rect[] boundingBoxes)
         {
             Tilemap = tilemap;
             WorldBounds = worldBounds;
-            CellBounds = cellBounds;
-            CellSize = cellSize;
+            BoundingBoxes = boundingBoxes;
         }
 
         internal Tilemap Tilemap { get; }
         internal Bounds WorldBounds { get; }
-        internal BoundsInt CellBounds { get; }
-        internal Vector3 CellSize { get; }
+        internal Rect[] BoundingBoxes { get; }
     }
 
     internal enum ObstacleKind
