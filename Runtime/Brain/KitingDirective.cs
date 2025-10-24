@@ -29,7 +29,11 @@ namespace AI_Mod.Runtime.Brain
             float radialAdjustment,
             float alternateLanePenalty,
             float alternateLaneScore,
-            int alternateLaneOrientation)
+            int alternateLaneOrientation,
+            float arcHalfAngleDegrees,
+            float arcAngleDegrees,
+            Vector2 arcMidlineDirection,
+            int arcDirectionSign)
         {
             Anchor = anchor;
             PreferredRadius = preferredRadius;
@@ -54,6 +58,10 @@ namespace AI_Mod.Runtime.Brain
             AlternateLanePenalty = alternateLanePenalty;
             AlternateLaneScore = alternateLaneScore;
             AlternateLaneOrientation = alternateLaneOrientation;
+            ArcHalfAngleDegrees = arcHalfAngleDegrees;
+            ArcAngleDegrees = arcAngleDegrees;
+            ArcMidlineDirection = arcMidlineDirection;
+            ArcDirectionSign = arcDirectionSign;
             HasDirective = true;
         }
 
@@ -82,7 +90,10 @@ namespace AI_Mod.Runtime.Brain
         internal float AlternateLaneScore { get; }
         internal int AlternateLaneOrientation { get; }
         internal bool HasAlternateOrbit => AlternateOrbitDirection.sqrMagnitude > 0.5f;
-        internal bool IsClockwise => LaneOrientation < 0;
+        internal float ArcHalfAngleDegrees { get; }
+        internal float ArcAngleDegrees { get; }
+        internal Vector2 ArcMidlineDirection { get; }
+        internal int ArcDirectionSign { get; }
 
         internal static KitingDirective Create(
             Vector2 anchor,
@@ -107,7 +118,11 @@ namespace AI_Mod.Runtime.Brain
             float radialAdjustment,
             float alternateLanePenalty,
             float alternateLaneScore,
-            int alternateLaneOrientation)
+            int alternateLaneOrientation,
+            float arcHalfAngleDegrees,
+            float arcAngleDegrees,
+            Vector2 arcMidlineDirection,
+            int arcDirectionSign)
         {
             return new KitingDirective(
                 anchor,
@@ -132,7 +147,11 @@ namespace AI_Mod.Runtime.Brain
                 radialAdjustment,
                 alternateLanePenalty,
                 alternateLaneScore,
-                alternateLaneOrientation);
+                alternateLaneOrientation,
+                arcHalfAngleDegrees,
+                arcAngleDegrees,
+                arcMidlineDirection,
+                arcDirectionSign);
         }
     }
 }

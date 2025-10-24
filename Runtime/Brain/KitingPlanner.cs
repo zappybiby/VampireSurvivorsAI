@@ -31,16 +31,29 @@ namespace AI_Mod.Runtime.Brain
         private const float StragglerAlignmentThreshold = 0.1f;
         private const float StragglerRadiusSlackMultiplier = 1.35f;
         private const float StragglerAdjustClamp = 0.85f;
+        private const float DesiredEnemyGapMultiplier = 3f;
+        private const float DesiredEnemyGapSlack = 0.12f;
+        private const float PreferredRadiusMaxOffset = 0.95f;
+        private const int StragglerClusterBaseline = 10;
+        private const float StragglerClusterDamp = 0.045f;
         private const float GemAlignmentThreshold = 0.2f;
         private const float GemDistanceSlack = 1.2f;
         private const float MinimumGemConsiderDistance = 0.35f;
-        private const float LaneSwitchScoreThreshold = 0.45f;
         private const float LaneSwitchCooldownSeconds = 1.25f;
         private const float LanePenaltyWeight = 1f;
         private const float StragglerBiasWeight = 0.85f;
         private const float GemBiasWeight = 0.65f;
         private const float EscapeBiasWeight = 0.75f;
         private const float ClearanceScoreScale = 1.1f;
+        private const float ArcHalfAngleDegreesBase = 85f;
+        private const float ArcHalfAngleDegreesMin = 55f;
+        private const float ArcHalfAngleDegreesMax = 120f;
+        private const float ArcHalfAngleTightenPerSpread = 35f;
+        private const float ArcHalfAngleTightenPerEncirclement = 25f;
+        private const float ArcCenterUpdateThresholdDegrees = 10f;
+        private const float ArcCenterSmoothingFactor = 0.15f;
+        private const float ArcSwitchHysteresisDegrees = 6f;
+        private const float ArcSwitchCooldownSeconds = 0.4f;
 
         private readonly List<DynamicObstacle> _clusterMembers = new List<DynamicObstacle>(64);
         private readonly List<float> _weights = new List<float>(64);
@@ -52,6 +65,8 @@ namespace AI_Mod.Runtime.Brain
         private bool _hasSmoothedRadius;
         private int _activeLaneOrientation;
         private float _lastLaneSwitchTime = float.NegativeInfinity;
+        private Vector2 _arcCenterDirection;
+        private bool _hasArcCenter;
 
         internal KitingDirective BuildDirective(AiWorldState world)
         {
@@ -119,14 +134,55 @@ namespace AI_Mod.Runtime.Brain
             var tangents = ComputeTangents(radialDirection);
             var clockwiseEvaluation = EvaluateLane(-1, anchor, tangents.clockwise, radialDirection, basePreferredRadius, radiusTolerance, world);
             var counterClockwiseEvaluation = EvaluateLane(1, anchor, tangents.counterClockwise, radialDirection, basePreferredRadius, radiusTolerance, world);
-            var selection = SelectLane(clockwiseEvaluation, counterClockwiseEvaluation);
-            var selected = selection.Primary;
-            var alternate = selection.Alternate;
+
+            var time = Time.unscaledTime;
+            if (_activeLaneOrientation == 0)
+            {
+                _activeLaneOrientation = counterClockwiseEvaluation.Score >= clockwiseEvaluation.Score ? 1 : -1;
+                _lastLaneSwitchTime = time;
+            }
+            else
+            {
+                var currentLane = _activeLaneOrientation > 0 ? counterClockwiseEvaluation : clockwiseEvaluation;
+                var oppositeLane = _activeLaneOrientation > 0 ? clockwiseEvaluation : counterClockwiseEvaluation;
+                if (currentLane.Penalty >= LanePenaltyBlockThreshold * 1.2f &&
+                    oppositeLane.Penalty + 0.35f < currentLane.Penalty &&
+                    time - _lastLaneSwitchTime >= LaneSwitchCooldownSeconds)
+                {
+                    _activeLaneOrientation = -_activeLaneOrientation;
+                    _lastLaneSwitchTime = time;
+                }
+            }
+
+            var selected = _activeLaneOrientation >= 0 ? counterClockwiseEvaluation : clockwiseEvaluation;
+            var alternate = _activeLaneOrientation >= 0 ? clockwiseEvaluation : counterClockwiseEvaluation;
 
             var adjustedPreferred = Mathf.Clamp(basePreferredRadius + selected.RadialAdjustment * RadiusAdjustScale, safeRadius, maxRadius);
             var preferredRadius = SmoothPreferredRadius(adjustedPreferred, safeRadius, maxRadius);
             var finalRadiusSpread = ComputeRadiusSpread(anchor, preferredRadius);
             radiusTolerance = Mathf.Max(radiusTolerance, finalRadiusSpread);
+
+            var arcHalfAngle = ResolveArcHalfAngle(finalRadiusSpread, safeRadius, world.Encirclement);
+            var arcAngle = UpdateArcCenter(radialDirection);
+
+            if (_activeLaneOrientation > 0 &&
+                arcAngle >= arcHalfAngle - ArcSwitchHysteresisDegrees &&
+                time - _lastLaneSwitchTime >= ArcSwitchCooldownSeconds)
+            {
+                _activeLaneOrientation = -1;
+                _lastLaneSwitchTime = time;
+                selected = clockwiseEvaluation;
+                alternate = counterClockwiseEvaluation;
+            }
+            else if (_activeLaneOrientation < 0 &&
+                arcAngle <= -arcHalfAngle + ArcSwitchHysteresisDegrees &&
+                time - _lastLaneSwitchTime >= ArcSwitchCooldownSeconds)
+            {
+                _activeLaneOrientation = 1;
+                _lastLaneSwitchTime = time;
+                selected = counterClockwiseEvaluation;
+                alternate = clockwiseEvaluation;
+            }
 
             var fallbackRequested = ShouldRequestFallback(selected, alternate, world.Encirclement);
             var averageVelocity = ComputeAverageVelocity();
@@ -165,7 +221,11 @@ namespace AI_Mod.Runtime.Brain
                 selected.RadialAdjustment,
                 alternate.Penalty,
                 alternate.Score,
-                alternate.Orientation);
+                alternate.Orientation,
+                arcHalfAngle,
+                arcAngle,
+                _arcCenterDirection,
+                _activeLaneOrientation);
         }
 
         private void CollectClusterMembers(AiWorldState world, float playerSpeed, out bool fastEnemyDetected)
@@ -301,26 +361,34 @@ namespace AI_Mod.Runtime.Brain
             out float safeRadius,
             out float maxRadius)
         {
-            safeRadius = Mathf.Max(MinimumKiteRadius, world.Player.Radius * 3f);
-            var nearestEnemy = float.MaxValue;
+            var desiredGap = Mathf.Max(MinimumKiteRadius, world.Player.Radius * DesiredEnemyGapMultiplier);
+            safeRadius = Mathf.Max(MinimumKiteRadius, desiredGap);
+            var nearestEnemyEdge = float.MaxValue;
 
             for (var i = 0; i < _clusterMembers.Count; i++)
             {
                 var enemy = _clusterMembers[i];
                 var delta = enemy.Position - playerPosition;
                 var distance = delta.magnitude - enemy.Radius;
-                if (distance < nearestEnemy)
+                if (distance < nearestEnemyEdge)
                 {
-                    nearestEnemy = distance;
+                    nearestEnemyEdge = distance;
                 }
             }
 
-            if (nearestEnemy < float.MaxValue)
+            if (nearestEnemyEdge < float.MaxValue)
             {
-                safeRadius = Mathf.Max(safeRadius, nearestEnemy + world.Player.Radius + SafeRadiusPadding);
+                var clampedNearest = Mathf.Max(0f, nearestEnemyEdge);
+                safeRadius = Mathf.Max(safeRadius, clampedNearest + world.Player.Radius + SafeRadiusPadding);
+                var gapLimited = clampedNearest + world.Player.Radius + desiredGap + DesiredEnemyGapSlack;
+                maxRadius = Mathf.Min(safeRadius + PreferredRadiusMaxOffset, gapLimited);
+            }
+            else
+            {
+                maxRadius = safeRadius + PreferredRadiusMaxOffset;
             }
 
-            maxRadius = safeRadius + 4f;
+            maxRadius = Mathf.Max(maxRadius, safeRadius + 0.1f);
             if (currentRadius < safeRadius)
             {
                 return safeRadius;
@@ -351,6 +419,47 @@ namespace AI_Mod.Runtime.Brain
 
             var average = sum / Mathf.Max(1, _clusterMembers.Count);
             return Mathf.Clamp(average, RadiusSpreadClampMin, RadiusSpreadClampMax);
+        }
+
+        private float ResolveArcHalfAngle(float radiusSpread, float safeRadius, EncirclementSnapshot encirclement)
+        {
+            var spreadRange = Mathf.Max(RadiusSpreadClampMax - RadiusSpreadClampMin, 0.0001f);
+            var spreadFactor = Mathf.Clamp01((radiusSpread - RadiusSpreadClampMin) / spreadRange);
+            var encirclementFactor = Mathf.Clamp01(encirclement.Intensity);
+            var baseAngle = ArcHalfAngleDegreesBase
+                - spreadFactor * ArcHalfAngleTightenPerSpread
+                - encirclementFactor * ArcHalfAngleTightenPerEncirclement;
+            return Mathf.Clamp(baseAngle, ArcHalfAngleDegreesMin, ArcHalfAngleDegreesMax);
+        }
+
+        private float UpdateArcCenter(Vector2 radialDirection)
+        {
+            if (!_hasArcCenter || radialDirection.sqrMagnitude < 0.0001f)
+            {
+                _arcCenterDirection = radialDirection.normalized;
+                _hasArcCenter = true;
+                return 0f;
+            }
+
+            var dot = Vector2.Dot(_arcCenterDirection, radialDirection);
+            if (!float.IsFinite(dot) || dot <= -0.1f)
+            {
+                _arcCenterDirection = radialDirection.normalized;
+                return 0f;
+            }
+
+            var angle = Mathf.Clamp(Vector2.SignedAngle(_arcCenterDirection, radialDirection), -180f, 180f);
+
+            if (Mathf.Abs(angle) <= ArcCenterUpdateThresholdDegrees)
+            {
+                var blended = Vector2.Lerp(_arcCenterDirection, radialDirection, ArcCenterSmoothingFactor);
+                if (blended.sqrMagnitude > 0.0001f)
+                {
+                    _arcCenterDirection = blended.normalized;
+                }
+            }
+
+            return angle;
         }
 
         private (Vector2 clockwise, Vector2 counterClockwise) ComputeTangents(Vector2 radialDirection)
@@ -405,7 +514,8 @@ namespace AI_Mod.Runtime.Brain
             var radiusSlack = radiusTolerance * StragglerRadiusSlackMultiplier;
             var outwardAdjust = 0f;
             var inwardAdjust = 0f;
-            var score = 0f;
+            var scoreAccumulator = 0f;
+            var weightSum = 0f;
 
             for (var i = 0; i < _clusterMembers.Count; i++)
             {
@@ -426,25 +536,35 @@ namespace AI_Mod.Runtime.Brain
 
                 var radialDelta = distance - preferredRadius;
                 var weight = alignment * (1f + obstacle.Radius);
+                weightSum += weight;
 
                 if (radialDelta > radiusTolerance)
                 {
                     var normalized = Mathf.Clamp(radialDelta / Mathf.Max(radiusSlack, 0.001f), 0f, 3f);
-                    score += weight * normalized;
+                    scoreAccumulator += weight * normalized;
                     outwardAdjust += Mathf.Clamp(radialDelta, 0f, StragglerAdjustClamp) * weight;
                 }
                 else if (radialDelta < -radiusTolerance)
                 {
                     var normalized = Mathf.Clamp(-radialDelta / Mathf.Max(radiusSlack, 0.001f), 0f, 3f);
-                    score += weight * normalized * 0.6f;
+                    scoreAccumulator += weight * normalized * 0.6f;
                     inwardAdjust += Mathf.Clamp(-radialDelta, 0f, StragglerAdjustClamp) * weight;
                 }
             }
 
-            var sampleCount = Mathf.Max(1, _clusterMembers.Count);
-            var adjustment = (outwardAdjust - inwardAdjust) / sampleCount;
-            adjustment = Mathf.Clamp(adjustment, -StragglerAdjustClamp, StragglerAdjustClamp);
-            return (score, adjustment);
+            if (weightSum <= 0f)
+            {
+                return (0f, 0f);
+            }
+
+            var normalization = Mathf.Max(weightSum, 1f);
+            var adjustment = Mathf.Clamp((outwardAdjust - inwardAdjust) / normalization, -StragglerAdjustClamp, StragglerAdjustClamp);
+            var normalizedScore = Mathf.Clamp(scoreAccumulator / normalization, -3f, 3f);
+
+            var clusterPenalty = Mathf.Max(0, _clusterMembers.Count - StragglerClusterBaseline);
+            var clusterScale = 1f / (1f + clusterPenalty * StragglerClusterDamp);
+
+            return (normalizedScore * clusterScale, adjustment * clusterScale);
         }
 
         private float ComputeGemBias(
@@ -517,49 +637,6 @@ namespace AI_Mod.Runtime.Brain
             var preferredOrientation = delta > 0f ? -1 : 1;
             var magnitude = encirclement.Intensity * (1.15f - encirclement.GapOccupancy * 0.35f);
             return orientation == preferredOrientation ? magnitude : -magnitude * 0.65f;
-        }
-
-        private LaneSelection SelectLane(LaneEvaluation clockwise, LaneEvaluation counterClockwise)
-        {
-            var time = Time.unscaledTime;
-
-            if (_activeLaneOrientation == 0)
-            {
-                var initial = counterClockwise.Score >= clockwise.Score ? counterClockwise : clockwise;
-                var alternate = initial.Orientation == clockwise.Orientation ? counterClockwise : clockwise;
-                _activeLaneOrientation = initial.Orientation;
-                _lastLaneSwitchTime = time;
-                return new LaneSelection(initial, alternate);
-            }
-
-            var current = _activeLaneOrientation == clockwise.Orientation ? clockwise : counterClockwise;
-            var alternateLane = current.Orientation == clockwise.Orientation ? counterClockwise : clockwise;
-
-            var currentPenalty = current.Penalty;
-            var alternatePenalty = alternateLane.Penalty;
-            var scoreGap = alternateLane.Score - current.Score;
-            var timeSinceSwitch = time - _lastLaneSwitchTime;
-
-            var forcedSwitch = currentPenalty >= LanePenaltyBlockThreshold * 1.05f && alternatePenalty + 0.2f < currentPenalty;
-            if (current.Direction.sqrMagnitude < 0.01f)
-            {
-                forcedSwitch = true;
-            }
-
-            if (!forcedSwitch && scoreGap > LaneSwitchScoreThreshold && timeSinceSwitch >= LaneSwitchCooldownSeconds)
-            {
-                forcedSwitch = true;
-            }
-
-            if (forcedSwitch)
-            {
-                _activeLaneOrientation = alternateLane.Orientation;
-                _lastLaneSwitchTime = time;
-                current = alternateLane;
-                alternateLane = current.Orientation == clockwise.Orientation ? counterClockwise : clockwise;
-            }
-
-            return new LaneSelection(current, alternateLane);
         }
 
         private bool ShouldRequestFallback(LaneEvaluation selected, LaneEvaluation alternate, EncirclementSnapshot encirclement)
@@ -657,6 +734,8 @@ namespace AI_Mod.Runtime.Brain
             _hasSmoothedRadius = false;
             _activeLaneOrientation = 0;
             _lastLaneSwitchTime = float.NegativeInfinity;
+            _hasArcCenter = false;
+            _arcCenterDirection = Vector2.zero;
         }
 
         private readonly struct LaneEvaluation
@@ -691,16 +770,5 @@ namespace AI_Mod.Runtime.Brain
             internal float RadialAdjustment { get; }
         }
 
-        private readonly struct LaneSelection
-        {
-            internal LaneSelection(LaneEvaluation primary, LaneEvaluation alternate)
-            {
-                Primary = primary;
-                Alternate = alternate;
-            }
-
-            internal LaneEvaluation Primary { get; }
-            internal LaneEvaluation Alternate { get; }
-        }
     }
 }

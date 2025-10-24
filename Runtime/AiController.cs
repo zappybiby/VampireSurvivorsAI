@@ -747,8 +747,25 @@ namespace AI_Mod.Runtime
                 return 0f;
             }
 
-            var alignment = ComputeTangentialAlignment(direction, directive);
-            var tangentialScore = alignment * KitingAlignmentWeight;
+            direction = direction.normalized;
+            var desiredTangent = directive.ArcDirectionSign >= 0 ? directive.OrbitDirection : directive.AlternateOrbitDirection;
+            var alternateTangent = directive.ArcDirectionSign >= 0 ? directive.AlternateOrbitDirection : directive.OrbitDirection;
+
+            var desiredAlignment = Mathf.Max(0f, Vector2.Dot(direction, desiredTangent));
+            var alternateAlignment = Mathf.Max(0f, Vector2.Dot(direction, alternateTangent));
+
+            var boundaryBuffer = Mathf.Max(5f, directive.ArcHalfAngleDegrees * 0.25f);
+            var distanceFromEdge = directive.ArcHalfAngleDegrees - Mathf.Abs(directive.ArcAngleDegrees);
+            var boundaryFactor = directive.ArcHalfAngleDegrees > 0.1f
+                ? Mathf.Clamp01(distanceFromEdge / boundaryBuffer)
+                : 1f;
+
+            var tangentialScore = desiredAlignment * KitingAlignmentWeight * Mathf.Max(0.25f, boundaryFactor);
+            if (distanceFromEdge <= boundaryBuffer * 0.6f && alternateAlignment > 0f)
+            {
+                var reverseFactor = 1f - Mathf.Clamp01(distanceFromEdge / (boundaryBuffer * 0.6f));
+                tangentialScore += alternateAlignment * KitingAlignmentWeight * reverseFactor * 0.6f;
+            }
 
             var radialComponent = Vector2.Dot(direction, directive.RadialDirection);
             var radiusDelta = directive.CurrentRadius - directive.PreferredRadius;
@@ -783,14 +800,23 @@ namespace AI_Mod.Runtime
                 return -1f;
             }
 
-            var primary = Vector2.Dot(direction, directive.OrbitDirection);
-            if (!directive.HasAlternateOrbit)
+            direction = direction.normalized;
+            var desired = directive.ArcDirectionSign >= 0 ? directive.OrbitDirection : directive.AlternateOrbitDirection;
+            var alignment = Vector2.Dot(direction, desired);
+            if (alignment <= 0f)
             {
-                return primary;
+                return alignment;
             }
 
-            var alternate = Vector2.Dot(direction, directive.AlternateOrbitDirection);
-            return Mathf.Abs(alternate) > Mathf.Abs(primary) ? alternate : primary;
+            if (directive.ArcHalfAngleDegrees <= 0.1f)
+            {
+                return alignment;
+            }
+
+            var distanceFromEdge = directive.ArcHalfAngleDegrees - Mathf.Abs(directive.ArcAngleDegrees);
+            var boundaryBuffer = Mathf.Max(5f, directive.ArcHalfAngleDegrees * 0.25f);
+            var boundaryFactor = Mathf.Clamp01(distanceFromEdge / boundaryBuffer);
+            return alignment * Mathf.Max(0.2f, boundaryFactor);
         }
 
         private float EvaluateCandidate(

@@ -139,7 +139,7 @@ namespace AI_Mod.Runtime
             _buffer.Append("Plan Mode: ").Append(planMode);
             if (directive.HasDirective)
             {
-                _buffer.Append(" | Orbit: ").Append(directive.IsClockwise ? "CW" : "CCW");
+                _buffer.Append(" | Arc Dir: ").Append(directive.ArcDirectionSign >= 0 ? "CCW" : "CW");
                 if (directive.FallbackRequested)
                 {
                     _buffer.Append(" | fallback queued");
@@ -200,6 +200,9 @@ namespace AI_Mod.Runtime
                         .Append(" | Score: ").Append(directive.AlternateLaneScore.ToString("F2"))
                         .Append(" | Penalty: ").Append(directive.AlternateLanePenalty.ToString("F2")).AppendLine();
                 }
+                _buffer.Append("Arc +/-deg: ").Append(directive.ArcHalfAngleDegrees.ToString("F0"))
+                    .Append(" | Arc angle: ").Append(directive.ArcAngleDegrees.ToString("F1"))
+                    .Append(" | Dir: ").Append(directive.ArcDirectionSign >= 0 ? "CCW" : "CW").AppendLine();
             }
             else
             {
@@ -261,7 +264,8 @@ namespace AI_Mod.Runtime
                 if (TryWorldToGui(directive.Anchor, camera, renderRect, sourceSize, out var anchorScreen))
                 {
                     DrawDisc(anchorScreen, 6f, _kitingAnchorColor);
-                    var preferredPixels = ResolveScreenRadius(directive.Anchor, Mathf.Max(directive.PreferredRadius, 0.05f), camera, renderRect, sourceSize, 4f, "OverlayKitePreferredFallback", "kiting preferred radius");
+                    var preferredRadius = Mathf.Max(directive.PreferredRadius, 0.05f);
+                    var preferredPixels = ResolveScreenRadius(directive.Anchor, preferredRadius, camera, renderRect, sourceSize, 4f, "OverlayKitePreferredFallback", "kiting preferred radius");
                     var outerRadius = directive.PreferredRadius + directive.RadiusTolerance;
                     var outerPixels = ResolveScreenRadius(directive.Anchor, Mathf.Max(outerRadius, 0.05f), camera, renderRect, sourceSize, 4f, "OverlayKiteOuterFallback", "kiting outer radius");
                     var innerRadius = Mathf.Max(0f, directive.PreferredRadius - directive.RadiusTolerance);
@@ -271,45 +275,67 @@ namespace AI_Mod.Runtime
                         innerPixels = ResolveScreenRadius(directive.Anchor, innerRadius, camera, renderRect, sourceSize, 3f, "OverlayKiteInnerFallback", "kiting inner radius");
                     }
 
-                    if (outerPixels > 0f)
-                    {
-                        DrawCircle(anchorScreen, outerPixels, _kitingToleranceColor, 64);
-                    }
+                    var midlineDirection = directive.ArcMidlineDirection.sqrMagnitude > 0.0001f
+                        ? directive.ArcMidlineDirection.normalized
+                        : (directive.RadialDirection.sqrMagnitude > 0.0001f ? directive.RadialDirection.normalized : Vector2.right);
+                    var halfAngle = Mathf.Max(1f, directive.ArcHalfAngleDegrees);
 
                     if (preferredPixels > 0f)
                     {
-                        DrawCircle(anchorScreen, preferredPixels, _kitingPreferredColor, 48);
+                        DrawArcWorld(directive.Anchor, preferredRadius, midlineDirection, halfAngle, camera, renderRect, sourceSize, _kitingPreferredColor, 36, LineThickness * 0.8f);
+                    }
+
+                    if (outerPixels > 0f)
+                    {
+                        DrawArcWorld(directive.Anchor, outerRadius, midlineDirection, halfAngle, camera, renderRect, sourceSize, _kitingToleranceColor, 44, LineThickness * 0.45f);
                     }
 
                     if (innerPixels > 0f)
                     {
-                        DrawCircle(anchorScreen, innerPixels, _kitingToleranceColor, 64);
+                        var faded = new Color(_kitingToleranceColor.r, _kitingToleranceColor.g, _kitingToleranceColor.b, _kitingToleranceColor.a * 0.75f);
+                        DrawArcWorld(directive.Anchor, innerRadius, midlineDirection, halfAngle, camera, renderRect, sourceSize, faded, 32, LineThickness * 0.4f);
                     }
 
-                    var radialVec = directive.RadialDirection;
-                    var radialValid = radialVec.sqrMagnitude > 0.0001f;
-                    var radialDir = radialValid ? radialVec.normalized : Vector2.up;
-                    if (radialValid)
+                    var midlineEndWorld = directive.Anchor + midlineDirection * preferredRadius;
+                    if (TryWorldToGui(midlineEndWorld, camera, renderRect, sourceSize, out var midlineScreen))
                     {
-                        var radialLength = Mathf.Max(preferredPixels, 45f);
-                        DrawArrow(anchorScreen, radialDir, radialLength, _kitingRadialColor, LineThickness * 0.7f);
+                        DrawLine(anchorScreen, midlineScreen, _kitingRadialColor, LineThickness * 0.7f);
+                        DrawDisc(midlineScreen, 4f, _kitingRadialColor);
                     }
 
-                    var orbitStartWorld = directive.Anchor + radialDir * Mathf.Max(directive.PreferredRadius, 0.2f);
-                    if (TryWorldToGui(orbitStartWorld, camera, renderRect, sourceSize, out var orbitScreen))
-                    {
-                        var orbitColor = directive.FallbackRequested ? _kitingFallbackColor : _kitingOrbitColor;
-                        var orbitLength = Mathf.Max(preferredPixels * 0.85f, 45f);
-                        DrawArrow(orbitScreen, directive.OrbitDirection, orbitLength, orbitColor, LineThickness * 0.9f);
+                    var boundaryPositive = RotateVector(midlineDirection, halfAngle);
+                    var boundaryNegative = RotateVector(midlineDirection, -halfAngle);
+                    var boundaryRadius = Mathf.Max(preferredRadius, 0.2f);
 
-                        if (directive.HasAlternateOrbit)
+                    var boundaryPositiveWorld = directive.Anchor + boundaryPositive * boundaryRadius;
+                    if (TryWorldToGui(boundaryPositiveWorld, camera, renderRect, sourceSize, out var boundaryPositiveScreen))
+                    {
+                        DrawLine(anchorScreen, boundaryPositiveScreen, _kitingToleranceColor, LineThickness * 0.55f);
+                        DrawDisc(boundaryPositiveScreen, 3f, _kitingToleranceColor);
+                    }
+
+                    var boundaryNegativeWorld = directive.Anchor + boundaryNegative * boundaryRadius;
+                    if (TryWorldToGui(boundaryNegativeWorld, camera, renderRect, sourceSize, out var boundaryNegativeScreen))
+                    {
+                        DrawLine(anchorScreen, boundaryNegativeScreen, _kitingToleranceColor, LineThickness * 0.55f);
+                        DrawDisc(boundaryNegativeScreen, 3f, _kitingToleranceColor);
+                    }
+
+                    if (hasPlayerScreen)
+                    {
+                        DrawLine(anchorScreen, playerScreen, new Color(_kitingRadialColor.r, _kitingRadialColor.g, _kitingRadialColor.b, 0.35f), LineThickness * 0.5f);
+
+                        var travelDir = directive.ArcDirectionSign >= 0 ? directive.OrbitDirection : directive.AlternateOrbitDirection;
+                        if (travelDir.sqrMagnitude > 0.0001f)
                         {
-                            DrawArrow(orbitScreen, directive.AlternateOrbitDirection, orbitLength * 0.7f, _kitingAlternateColor, LineThickness * 0.6f);
+                            var travelLength = Mathf.Max(preferredPixels * 0.8f, 38f);
+                            var travelColor = directive.FallbackRequested ? _kitingFallbackColor : _kitingOrbitColor;
+                            DrawArrow(playerScreen, travelDir.normalized, travelLength, travelColor, LineThickness);
                         }
                     }
 
-                    DrawWorldLabel(anchorScreen + new Vector2(0f, -14f), directive.IsClockwise ? "CW orbit" : "CCW orbit", _kitingTextColor, new Vector2(0.5f, 1f));
-                    DrawWorldLabel(anchorScreen + new Vector2(0f, 10f), $"clr {directive.ClearanceScore:F2}", _kitingTextColor, new Vector2(0.5f, 0f));
+                    DrawWorldLabel(anchorScreen + new Vector2(0f, -16f), $"arc ±{halfAngle:F0}°", _kitingTextColor, new Vector2(0.5f, 1f));
+                    DrawWorldLabel(anchorScreen + new Vector2(0f, 6f), $"ang {directive.ArcAngleDegrees:F1}° | clr {directive.ClearanceScore:F2}", _kitingTextColor, new Vector2(0.5f, 0f));
                 }
             }
 
@@ -391,6 +417,68 @@ namespace AI_Mod.Runtime
                 DrawLine(previous, current, color, LineThickness * 0.6f);
                 previous = current;
             }
+        }
+
+        private void DrawArcWorld(
+            Vector2 center,
+            float radius,
+            Vector2 midlineDirection,
+            float halfAngleDegrees,
+            Camera camera,
+            Rect renderRect,
+            Vector2 sourceSize,
+            Color color,
+            int segments,
+            float thickness)
+        {
+            if (_pixel == null || radius <= 0f || segments < 2 || midlineDirection.sqrMagnitude < 0.0001f)
+            {
+                return;
+            }
+
+            var step = (halfAngleDegrees * 2f) / segments;
+            var start = -halfAngleDegrees;
+            Vector2? previous = null;
+
+            for (var i = 0; i <= segments; i++)
+            {
+                var angle = start + step * i;
+                var worldDir = RotateVector(midlineDirection, angle);
+                if (worldDir.sqrMagnitude < 0.0001f)
+                {
+                    previous = null;
+                    continue;
+                }
+
+                var worldPoint = center + worldDir.normalized * radius;
+                if (!TryWorldToGui(worldPoint, camera, renderRect, sourceSize, out var screenPoint))
+                {
+                    previous = null;
+                    continue;
+                }
+
+                if (previous.HasValue)
+                {
+                    DrawLine(previous.Value, screenPoint, color, thickness);
+                }
+
+                previous = screenPoint;
+            }
+        }
+
+        private static Vector2 RotateVector(Vector2 direction, float degrees)
+        {
+            if (direction.sqrMagnitude < 0.0001f)
+            {
+                return direction;
+            }
+
+            var radians = degrees * Mathf.Deg2Rad;
+            var sin = Mathf.Sin(radians);
+            var cos = Mathf.Cos(radians);
+            return new Vector2(
+                direction.x * cos - direction.y * sin,
+                direction.x * sin + direction.y * cos);
         }
 
         [HideFromIl2Cpp]
