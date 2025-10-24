@@ -1,0 +1,134 @@
+// === REPL:  Il2Cpp.PhaserTilemap dump of given instance ID of a Wall
+var targetId = -174300; // <-- your instance id
+
+var sb = new System.Text.StringBuilder();
+var flags = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static;
+
+// -------- resolve object by instance id --------
+UnityEngine.Object uobj = null;
+var miFind = typeof(UnityEngine.Object).GetMethod("FindObjectFromInstanceID",
+    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+try { if (miFind != null) uobj = miFind.Invoke(null, new object[]{ targetId }) as UnityEngine.Object; } catch {}
+if (uobj == null) {
+    var all = UnityEngine.Resources.FindObjectsOfTypeAll<UnityEngine.Object>();
+    for (int i = 0; i < all.Length; i++) if (all[i].GetInstanceID() == targetId) { uobj = all[i]; break; }
+}
+if (uobj == null) { UnityExplorer.ExplorerCore.Log($"No UnityEngine.Object with instance ID {targetId} found."); goto END; }
+
+var go = (uobj as UnityEngine.GameObject) ??
+         ((uobj as UnityEngine.Component) != null ? (uobj as UnityEngine.Component).gameObject : null);
+if (go == null) { UnityExplorer.ExplorerCore.Log($"Object {uobj} is not a GameObject/Component."); goto END; }
+
+// -------- helpers --------
+System.Func<object,string> Safe = (o) => { try { return o == null ? "null" : o.ToString(); } catch { return "(ToString failed)"; } };
+
+// Pretty-print Il2CppStructArray<>/array-like (Length + get_Item)
+System.Action<System.Text.StringBuilder,string,object> PrintMaybeArray = (sink, label, val) => {
+    if (val == null) { sink.AppendLine(label + ": null"); return; }
+    var t = val.GetType();
+    var getI = t.GetMethod("get_Item", flags);
+    var lenP = t.GetProperty("Length", flags);
+    if (getI != null && lenP != null) {
+        int len = 0; try { var lo = lenP.GetValue(val, null); len = (lo is int) ? (int)lo : 0; } catch {}
+        sink.AppendLine($"{label} [length={len}]");
+        for (int i = 0; i < len; i++) {
+            object elem = null; try { elem = getI.Invoke(val, new object[]{ i }); } catch {}
+            sink.AppendLine($"  [{i}] {Safe(elem)}");
+        }
+        return;
+    }
+    sink.AppendLine(label + ": " + Safe(val));
+};
+
+// Try get a field or property by common names/variants
+System.Func<object,string,object> GetMember = (obj, name) => {
+    if (obj == null) return null;
+    var t = obj.GetType();
+
+    // property exact / PascalCase
+    var p = t.GetProperty(name, flags) ?? t.GetProperty(char.ToUpper(name[0]) + name.Substring(1), flags);
+    if (p != null) return p.GetValue(obj, null);
+
+    // common field variants
+    string[] tries = {
+        name, "_" + name, "m_" + name,
+        char.ToUpper(name[0]) + name.Substring(1),
+        "_" + char.ToUpper(name[0]) + name.Substring(1),
+        "m_" + char.ToUpper(name[0]) + name.Substring(1),
+        "<" + (char.ToUpper(name[0]) + name.Substring(1)) + ">k__BackingField"
+    };
+    for (int i = 0; i < tries.Length; i++) {
+        var f = t.GetField(tries[i], flags);
+        if (f != null) return f.GetValue(obj);
+    }
+    return null;
+};
+
+// -------- header --------
+sb.AppendLine($"== Dump for: {go.name} (instanceID {targetId}) ==");
+sb.AppendLine($"activeSelf={go.activeSelf}, layer={go.layer}, tag={go.tag}");
+sb.AppendLine();
+
+// -------- strongly-typed grab: Il2Cpp.PhaserTilemap --------
+// NOTE: This is the key difference — using the *generic* overload binds the Il2Cpp type correctly.
+Il2Cpp.PhaserTilemap phaser = null;
+try { phaser = go.GetComponent<Il2Cpp.PhaserTilemap>(); } catch {}
+
+if (phaser == null) {
+    // very defensive fallback: find the Behaviour whose ToString() says (PhaserTilemap) and cast
+    var comps = go.GetComponents<UnityEngine.Component>();
+    for (int i = 0; i < comps.Length && phaser == null; i++) {
+        var c = comps[i];
+        if (c == null) continue;
+        string s = ""; try { s = c.ToString(); } catch {}
+        if (s.IndexOf("(PhaserTilemap)", System.StringComparison.OrdinalIgnoreCase) >= 0) {
+            try { phaser = (Il2Cpp.PhaserTilemap)(object)c; } catch {}
+        }
+    }
+}
+
+if (phaser == null) {
+    sb.AppendLine("Il2Cpp.PhaserTilemap: (not found via generic GetComponent or cast from Behaviour)");
+} else {
+    sb.AppendLine("-- Il2Cpp.PhaserTilemap --");
+
+    // Your requested members:
+    var v_world  = GetMember(phaser, "_worldBounds")   ?? GetMember(phaser, "worldBounds")   ?? GetMember(phaser, "WorldBounds");
+    var v_prec   = GetMember(phaser, "precachedBounds")?? GetMember(phaser, "_precachedBounds") ?? GetMember(phaser, "PrecachedBounds");
+    var v_parent = GetMember(phaser, "_parentBounds")  ?? GetMember(phaser, "parentBounds")  ?? GetMember(phaser, "ParentBounds");
+    var v_bounds = GetMember(phaser, "_bounds")        ?? GetMember(phaser, "bounds")        ?? GetMember(phaser, "Bounds");
+
+    PrintMaybeArray(sb, "PhaserTilemap._worldBounds",    v_world);
+    PrintMaybeArray(sb, "PhaserTilemap.precachedBounds", v_prec);
+    PrintMaybeArray(sb, "PhaserTilemap._parentBounds",   v_parent);
+    PrintMaybeArray(sb, "PhaserTilemap._bounds",         v_bounds);
+}
+sb.AppendLine();
+
+// -------- TilemapRenderer --------
+var tmr = go.GetComponent<UnityEngine.Tilemaps.TilemapRenderer>();
+if (tmr != null) {
+    var r = (UnityEngine.Renderer)tmr;
+    sb.AppendLine("-- UnityEngine.Tilemaps.TilemapRenderer --");
+    sb.AppendLine($"Renderer.bounds: {r.bounds}");
+    sb.AppendLine($"Renderer.localToWorldMatrix:\n{r.localToWorldMatrix}");
+} else sb.AppendLine("TilemapRenderer: (none)");
+sb.AppendLine();
+
+// -------- Tilemap --------
+var tmap = go.GetComponent<UnityEngine.Tilemaps.Tilemap>();
+if (tmap != null) {
+    sb.AppendLine("-- UnityEngine.Tilemaps.Tilemap --");
+    sb.AppendLine($"Tilemap.orientation: {tmap.orientation}");
+    sb.AppendLine($"GridLayout.cellSize: {tmap.cellSize}");
+    sb.AppendLine($"Tilemap.cellBounds: {tmap.cellBounds}");
+    sb.AppendLine($"Tilemap.origin: {tmap.origin}");
+    sb.AppendLine($"Tilemap.size: {tmap.size}");
+} else sb.AppendLine("Tilemap: (none)");
+sb.AppendLine();
+
+END:
+var output = sb.ToString();
+UnityExplorer.ExplorerCore.Log(output);
+output;

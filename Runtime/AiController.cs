@@ -1013,11 +1013,6 @@ namespace AI_Mod.Runtime
                     continue;
                 }
 
-                if (!WallGeometry.CircleIntersectsBounds(position, safeRadius, entry.WorldBounds))
-                {
-                    continue;
-                }
-
                 for (var j = 0; j < boundingBoxes.Length; j++)
                 {
                     var rect = boundingBoxes[j];
