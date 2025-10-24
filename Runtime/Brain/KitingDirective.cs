@@ -10,6 +10,7 @@ namespace AI_Mod.Runtime.Brain
             Vector2 anchor,
             float preferredRadius,
             float radiusTolerance,
+            float radiusSpread,
             Vector2 radialDirection,
             Vector2 orbitDirection,
             Vector2 alternateOrbitDirection,
@@ -18,11 +19,22 @@ namespace AI_Mod.Runtime.Brain
             float swarmOutrunBias,
             float clearanceScore,
             bool fallbackRequested,
-            int sampleCount)
+            int sampleCount,
+            float lanePenalty,
+            float laneScore,
+            float stragglerScore,
+            float gemScore,
+            float escapeScore,
+            int laneOrientation,
+            float radialAdjustment,
+            float alternateLanePenalty,
+            float alternateLaneScore,
+            int alternateLaneOrientation)
         {
             Anchor = anchor;
             PreferredRadius = preferredRadius;
             RadiusTolerance = radiusTolerance;
+            RadiusSpread = radiusSpread;
             RadialDirection = radialDirection;
             OrbitDirection = orbitDirection;
             AlternateOrbitDirection = alternateOrbitDirection;
@@ -32,6 +44,16 @@ namespace AI_Mod.Runtime.Brain
             ClearanceScore = clearanceScore;
             FallbackRequested = fallbackRequested;
             SampleCount = sampleCount;
+            LanePenalty = lanePenalty;
+            LaneScore = laneScore;
+            StragglerScore = stragglerScore;
+            GemScore = gemScore;
+            EscapeScore = escapeScore;
+            LaneOrientation = laneOrientation;
+            RadialAdjustment = radialAdjustment;
+            AlternateLanePenalty = alternateLanePenalty;
+            AlternateLaneScore = alternateLaneScore;
+            AlternateLaneOrientation = alternateLaneOrientation;
             HasDirective = true;
         }
 
@@ -39,6 +61,7 @@ namespace AI_Mod.Runtime.Brain
         internal Vector2 Anchor { get; }
         internal float PreferredRadius { get; }
         internal float RadiusTolerance { get; }
+        internal float RadiusSpread { get; }
         internal Vector2 RadialDirection { get; }
         internal Vector2 OrbitDirection { get; }
         internal Vector2 AlternateOrbitDirection { get; }
@@ -48,12 +71,24 @@ namespace AI_Mod.Runtime.Brain
         internal float ClearanceScore { get; }
         internal bool FallbackRequested { get; }
         internal int SampleCount { get; }
+        internal float LanePenalty { get; }
+        internal float LaneScore { get; }
+        internal float StragglerScore { get; }
+        internal float GemScore { get; }
+        internal float EscapeScore { get; }
+        internal int LaneOrientation { get; }
+        internal float RadialAdjustment { get; }
+        internal float AlternateLanePenalty { get; }
+        internal float AlternateLaneScore { get; }
+        internal int AlternateLaneOrientation { get; }
         internal bool HasAlternateOrbit => AlternateOrbitDirection.sqrMagnitude > 0.5f;
+        internal bool IsClockwise => LaneOrientation < 0;
 
         internal static KitingDirective Create(
             Vector2 anchor,
             float preferredRadius,
             float radiusTolerance,
+            float radiusSpread,
             Vector2 radialDirection,
             Vector2 orbitDirection,
             Vector2 alternateOrbitDirection,
@@ -62,12 +97,23 @@ namespace AI_Mod.Runtime.Brain
             float swarmOutrunBias,
             float clearanceScore,
             bool fallbackRequested,
-            int sampleCount)
+            int sampleCount,
+            float lanePenalty,
+            float laneScore,
+            float stragglerScore,
+            float gemScore,
+            float escapeScore,
+            int laneOrientation,
+            float radialAdjustment,
+            float alternateLanePenalty,
+            float alternateLaneScore,
+            int alternateLaneOrientation)
         {
             return new KitingDirective(
                 anchor,
                 preferredRadius,
                 radiusTolerance,
+                radiusSpread,
                 radialDirection,
                 orbitDirection,
                 alternateOrbitDirection,
@@ -76,7 +122,17 @@ namespace AI_Mod.Runtime.Brain
                 swarmOutrunBias,
                 clearanceScore,
                 fallbackRequested,
-                sampleCount);
+                sampleCount,
+                lanePenalty,
+                laneScore,
+                stragglerScore,
+                gemScore,
+                escapeScore,
+                laneOrientation,
+                radialAdjustment,
+                alternateLanePenalty,
+                alternateLaneScore,
+                alternateLaneOrientation);
         }
     }
 }

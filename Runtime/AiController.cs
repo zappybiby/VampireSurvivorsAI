@@ -26,6 +26,7 @@ namespace AI_Mod.Runtime
         private CharacterController? _player;
         private Vector2 _desiredDirection = Vector2.zero;
         private PlannerResult _lastPlan = PlannerResult.Zero;
+        private KitingDirective _lastKitingDirective = KitingDirective.None;
         private float _lastWorldSyncTime;
         private float _lastDebugLogTime;
         private int _lastPlannedWorldVersion = -1;
@@ -74,12 +75,14 @@ namespace AI_Mod.Runtime
             if (!_stateMonitor.IsGameplayActive)
             {
                 _desiredDirection = Vector2.zero;
+                _lastKitingDirective = KitingDirective.None;
                 return;
             }
 
             EnsurePlayerReference();
             if (_player == null)
             {
+                _lastKitingDirective = KitingDirective.None;
                 MaybeLogDebugInfo();
                 return;
             }
@@ -95,6 +98,7 @@ namespace AI_Mod.Runtime
             if (_world.Version >= 0 && (worldUpdated || _lastPlannedWorldVersion != _world.Version))
             {
                 var kitingDirective = _kitingPlanner.BuildDirective(_world);
+                _lastKitingDirective = kitingDirective;
                 var plannerDirective = kitingDirective;
                 string? fallbackMessage = null;
 
@@ -170,6 +174,8 @@ namespace AI_Mod.Runtime
         [HideFromIl2Cpp]
         internal AiWorldState WorldState => _world;
         internal PlannerResult LastPlan => _lastPlan;
+        [HideFromIl2Cpp]
+        internal KitingDirective LastKitingDirective => _lastKitingDirective;
         [HideFromIl2Cpp]
         internal PlannerDebugInfo PlannerDebug => _planner.DebugInfo;
         internal Vector2 DesiredDirection => _desiredDirection;
@@ -643,6 +649,11 @@ namespace AI_Mod.Runtime
 
             foreach (var candidate in EnumerateDirections())
             {
+                if (directive.HasDirective && candidate.sqrMagnitude < 0.0001f)
+                {
+                    continue;
+                }
+
                 var velocity = candidate * speed;
                 _trajectoryScratch.Clear();
                 float enemyOverlapSeconds;

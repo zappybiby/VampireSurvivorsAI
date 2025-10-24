@@ -30,6 +30,14 @@ namespace AI_Mod.Runtime
         private readonly Color _gemColor = new Color(0.2f, 0.95f, 0.2f, 0.95f);
         private readonly Color _playerColor = new Color(0.95f, 0.95f, 0.95f, 0.95f);
         private readonly Color _breakoutColor = new Color(1f, 0.35f, 0.6f, 0.95f);
+        private readonly Color _kitingAnchorColor = new Color(0.15f, 0.95f, 0.85f, 0.95f);
+        private readonly Color _kitingPreferredColor = new Color(0.1f, 0.75f, 1f, 0.65f);
+        private readonly Color _kitingToleranceColor = new Color(0.1f, 0.4f, 0.95f, 0.32f);
+        private readonly Color _kitingOrbitColor = new Color(0.95f, 0.85f, 0.2f, 0.95f);
+        private readonly Color _kitingAlternateColor = new Color(0.95f, 0.4f, 0.4f, 0.85f);
+        private readonly Color _kitingRadialColor = new Color(0.65f, 0.95f, 0.35f, 0.85f);
+        private readonly Color _kitingTextColor = new Color(0.85f, 0.95f, 1f, 0.95f);
+        private readonly Color _kitingFallbackColor = new Color(1f, 0.55f, 0.2f, 0.95f);
         private readonly StringBuilder _buffer = new StringBuilder(256);
         private readonly FallbackLogger _fallbacks = new FallbackLogger();
 
@@ -117,6 +125,8 @@ namespace AI_Mod.Runtime
             var debug = controller.PlannerDebug;
             var planDirection = controller.LastPlan.Direction;
             var encirclement = world.Encirclement;
+            var directive = controller.LastKitingDirective;
+            var planMode = controller.LastPlan.Mode;
 
             _buffer.Clear();
             _buffer.AppendLine("AI Debug Overlay");
@@ -126,7 +136,16 @@ namespace AI_Mod.Runtime
             _buffer.Append("Player Pos: ").Append(world.Player.Position.x.ToString("F2")).Append(", ").Append(world.Player.Position.y.ToString("F2")).AppendLine();
             _buffer.Append("Player Vel: ").Append(world.Player.Velocity.x.ToString("F2")).Append(", ").Append(world.Player.Velocity.y.ToString("F2")).AppendLine();
             _buffer.Append("Desired Dir: ").Append(planDirection.x.ToString("F2")).Append(", ").Append(planDirection.y.ToString("F2")).AppendLine();
-            _buffer.Append("Plan Mode: ").Append(controller.LastPlan.Mode).AppendLine();
+            _buffer.Append("Plan Mode: ").Append(planMode);
+            if (directive.HasDirective)
+            {
+                _buffer.Append(" | Orbit: ").Append(directive.IsClockwise ? "CW" : "CCW");
+                if (directive.FallbackRequested)
+                {
+                    _buffer.Append(" | fallback queued");
+                }
+            }
+            _buffer.AppendLine();
             _buffer.Append("Planner Score: ").Append(debug.HasBest ? debug.BestScore.ToString("F2") : "n/a").AppendLine();
             _buffer.Append("Candidates: ").Append(debug.Candidates.Count).AppendLine();
             _buffer.Append("Enemies: ").Append(world.EnemyObstacles.Count).Append(" | Bullets: ").Append(world.BulletObstacles.Count).AppendLine();
@@ -152,8 +171,42 @@ namespace AI_Mod.Runtime
                 }
                 _buffer.AppendLine();
             }
+            if (directive.HasDirective)
+            {
+                _buffer.Append("Kite Samples: ").Append(directive.SampleCount)
+                    .Append(" | Clearance: ").Append(directive.ClearanceScore.ToString("F2"))
+                    .Append(" | Outrun: ").Append(directive.SwarmOutrunBias.ToString("F2"))
+                    .Append(" | Swarm v: ").Append(directive.SwarmSpeed.ToString("F2")).AppendLine();
+                _buffer.Append("Radius cur/pre±tol: ")
+                    .Append(directive.CurrentRadius.ToString("F2"))
+                    .Append(" / ")
+                    .Append(directive.PreferredRadius.ToString("F2"))
+                    .Append(" ± ")
+                    .Append(directive.RadiusTolerance.ToString("F2"))
+                    .Append(" | Spread: ")
+                    .Append(directive.RadiusSpread.ToString("F2")).AppendLine();
+                _buffer.Append("Lane Score/Pen: ")
+                    .Append(directive.LaneScore.ToString("F2"))
+                    .Append(" / ")
+                    .Append(directive.LanePenalty.ToString("F2"))
+                    .Append(" | Herd S/G/E: ")
+                    .Append(directive.StragglerScore.ToString("F2")).Append('/')
+                    .Append(directive.GemScore.ToString("F2")).Append('/')
+                    .Append(directive.EscapeScore.ToString("F2")).AppendLine();
+                if (directive.HasAlternateOrbit)
+                {
+                    _buffer.Append("Alt Lane: ")
+                        .Append(directive.AlternateLaneOrientation < 0 ? "CW" : "CCW")
+                        .Append(" | Score: ").Append(directive.AlternateLaneScore.ToString("F2"))
+                        .Append(" | Penalty: ").Append(directive.AlternateLanePenalty.ToString("F2")).AppendLine();
+                }
+            }
+            else
+            {
+                _buffer.Append("Kite Samples: 0 | Clearance: n/a | Outrun: 0.00 | Swarm v: 0.00").AppendLine();
+            }
 
-            var panelHeight = 210f;
+            var panelHeight = 300f;
             var rect = new Rect(PanelMargin, PanelMargin, PanelWidth, panelHeight);
             DrawFilledRect(rect, _panelColor);
             GUI.Label(new Rect(rect.x + 8f, rect.y + 6f, rect.width - 12f, rect.height - 12f), _buffer.ToString(), _labelStyle);
@@ -163,6 +216,7 @@ namespace AI_Mod.Runtime
         {
             var world = controller.WorldState;
             var debug = controller.PlannerDebug;
+            var directive = controller.LastKitingDirective;
 
             Vector2 playerScreen = default;
             var hasPlayerScreen = world.Player.IsValid && TryWorldToGui(world.Player.Position, camera, renderRect, sourceSize, out playerScreen);
@@ -200,6 +254,63 @@ namespace AI_Mod.Runtime
             if (debug.HasBest)
             {
                 DrawTrajectory(debug.BestTrajectory, camera, _pathColor, renderRect, sourceSize);
+            }
+
+            if (directive.HasDirective)
+            {
+                if (TryWorldToGui(directive.Anchor, camera, renderRect, sourceSize, out var anchorScreen))
+                {
+                    DrawDisc(anchorScreen, 6f, _kitingAnchorColor);
+                    var preferredPixels = ResolveScreenRadius(directive.Anchor, Mathf.Max(directive.PreferredRadius, 0.05f), camera, renderRect, sourceSize, 4f, "OverlayKitePreferredFallback", "kiting preferred radius");
+                    var outerRadius = directive.PreferredRadius + directive.RadiusTolerance;
+                    var outerPixels = ResolveScreenRadius(directive.Anchor, Mathf.Max(outerRadius, 0.05f), camera, renderRect, sourceSize, 4f, "OverlayKiteOuterFallback", "kiting outer radius");
+                    var innerRadius = Mathf.Max(0f, directive.PreferredRadius - directive.RadiusTolerance);
+                    float innerPixels = 0f;
+                    if (innerRadius > 0.05f)
+                    {
+                        innerPixels = ResolveScreenRadius(directive.Anchor, innerRadius, camera, renderRect, sourceSize, 3f, "OverlayKiteInnerFallback", "kiting inner radius");
+                    }
+
+                    if (outerPixels > 0f)
+                    {
+                        DrawCircle(anchorScreen, outerPixels, _kitingToleranceColor, 64);
+                    }
+
+                    if (preferredPixels > 0f)
+                    {
+                        DrawCircle(anchorScreen, preferredPixels, _kitingPreferredColor, 48);
+                    }
+
+                    if (innerPixels > 0f)
+                    {
+                        DrawCircle(anchorScreen, innerPixels, _kitingToleranceColor, 64);
+                    }
+
+                    var radialVec = directive.RadialDirection;
+                    var radialValid = radialVec.sqrMagnitude > 0.0001f;
+                    var radialDir = radialValid ? radialVec.normalized : Vector2.up;
+                    if (radialValid)
+                    {
+                        var radialLength = Mathf.Max(preferredPixels, 45f);
+                        DrawArrow(anchorScreen, radialDir, radialLength, _kitingRadialColor, LineThickness * 0.7f);
+                    }
+
+                    var orbitStartWorld = directive.Anchor + radialDir * Mathf.Max(directive.PreferredRadius, 0.2f);
+                    if (TryWorldToGui(orbitStartWorld, camera, renderRect, sourceSize, out var orbitScreen))
+                    {
+                        var orbitColor = directive.FallbackRequested ? _kitingFallbackColor : _kitingOrbitColor;
+                        var orbitLength = Mathf.Max(preferredPixels * 0.85f, 45f);
+                        DrawArrow(orbitScreen, directive.OrbitDirection, orbitLength, orbitColor, LineThickness * 0.9f);
+
+                        if (directive.HasAlternateOrbit)
+                        {
+                            DrawArrow(orbitScreen, directive.AlternateOrbitDirection, orbitLength * 0.7f, _kitingAlternateColor, LineThickness * 0.6f);
+                        }
+                    }
+
+                    DrawWorldLabel(anchorScreen + new Vector2(0f, -14f), directive.IsClockwise ? "CW orbit" : "CCW orbit", _kitingTextColor, new Vector2(0.5f, 1f));
+                    DrawWorldLabel(anchorScreen + new Vector2(0f, 10f), $"clr {directive.ClearanceScore:F2}", _kitingTextColor, new Vector2(0.5f, 0f));
+                }
             }
 
             for (var i = 0; i < world.EnemyObstacles.Count; i++)
@@ -244,6 +355,24 @@ namespace AI_Mod.Runtime
                 }
             }
 
+        }
+
+        private void DrawArrow(Vector2 origin, Vector2 direction, float length, Color color, float thickness)
+        {
+            if (_pixel == null || direction.sqrMagnitude < 0.0001f || length <= 0f)
+            {
+                return;
+            }
+
+            var normalized = direction.normalized;
+            var end = origin + normalized * length;
+            DrawLine(origin, end, color, thickness);
+
+            var headSize = Mathf.Max(6f, thickness * 3f);
+            var headBase = end - normalized * headSize;
+            var perp = new Vector2(-normalized.y, normalized.x) * (headSize * 0.55f);
+            DrawLine(end, headBase + perp, color, thickness);
+            DrawLine(end, headBase - perp, color, thickness);
         }
 
         private void DrawCircle(Vector2 center, float radius, Color color, int segments)
@@ -363,6 +492,23 @@ namespace AI_Mod.Runtime
             GUI.color = cachedColor;
 
             GUI.matrix = matrix;
+        }
+
+        private void DrawWorldLabel(Vector2 position, string text, Color color, Vector2 pivot)
+        {
+            EnsureLabelStyle();
+            if (_labelStyle == null)
+            {
+                return;
+            }
+
+            var cachedColor = GUI.color;
+            GUI.color = color;
+            var content = new GUIContent(text);
+            var size = _labelStyle.CalcSize(content);
+            var rect = new Rect(position.x - size.x * pivot.x, position.y - size.y * pivot.y, size.x, size.y);
+            GUI.Label(rect, content, _labelStyle);
+            GUI.color = cachedColor;
         }
 
         private void DrawStatusBanner(string message)
