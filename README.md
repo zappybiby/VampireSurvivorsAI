@@ -1,13 +1,6 @@
 melonloader mod - AI plays vampire survivors   
 
-algo: velocity obstacle lite
+Uses a velocity obstacle based method to avoid harm
 
-tried to make it kite
-
-doesn't really kite
-
-also wall detection is bugged
-
-but the debug draw is pretty cool
-
+tries to kite enemies by staying within a certain distancae and following an arc pattern around clusters of enemies
 ![image](image.png)
